@@ -219,7 +219,8 @@ legend { padding: 0; margin-bottom: 2px; font-size: 13.5px; font-weight: 600; co
 
 .main { padding-top: 20px; padding-bottom: 48px; outline: none; }
 .foot { padding-bottom: 32px; font-size: 12.5px; color: var(--text-3); }
-.view { display: grid; gap: 20px; }
+/* One shrinkable column: no nowrap descendant can widen a whole view past the screen. */
+.view { display: grid; grid-template-columns: minmax(0, 1fr); gap: 20px; }
 .view-head { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px 16px; }
 .view-title { font-size: 24px; line-height: 1.2; letter-spacing: -.02em; }
 .view-sub { color: var(--text-2); margin-top: 4px; }
@@ -314,8 +315,15 @@ legend { padding: 0; margin-bottom: 2px; font-size: 13.5px; font-weight: 600; co
 .detail-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 12px; font-size: 13.5px; color: var(--text-3); }
 .controls { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 4px; }
 .callout { display: flex; gap: 12px; align-items: flex-start; padding: 14px 16px; border-radius: var(--radius-sm); border: 1px solid var(--danger-border); background: var(--red-bg); color: var(--red-fg); }
-.callout .icon { margin-top: 2px; }
+.callout > .icon { margin-top: 2px; }
 .callout strong { display: block; }
+.callout-body { flex: 1; min-width: 0; }
+.cap-form { display: grid; gap: 6px; margin-top: 12px; }
+.cap-form label { font-size: 13.5px; font-weight: 600; }
+.cap-row { display: flex; flex-wrap: wrap; gap: 8px; }
+.cap-row .input { flex: 1 1 7em; max-width: 11em; }
+.not-found { display: grid; gap: 10px; justify-items: center; padding: 32px 20px; }
+.not-found-title { font-size: 19px; letter-spacing: -.01em; color: var(--text); }
 .gates { display: grid; gap: 12px; }
 .gates > .section-title { color: var(--attn-text); }
 .gates > .section-title .count { background: var(--attn); color: #fff; }
@@ -326,6 +334,8 @@ legend { padding: 0; margin-bottom: 2px; font-size: 13.5px; font-weight: 600; co
 .gate-task { font-weight: 600; }
 .gate-summary { font-size: 15px; }
 .gate-meta { font-size: 13.5px; color: var(--text-3); }
+.gate-changes { display: grid; gap: 8px; padding: 12px 14px; border-radius: var(--radius-sm); background: var(--surface); border: 1px solid var(--border); }
+.gate-changes-head { font-size: 13.5px; font-weight: 600; color: var(--text-2); }
 .gate-hint { font-size: 13.5px; color: var(--text-2); padding: 10px 12px; border-radius: var(--radius-sm); background: var(--surface); border: 1px solid var(--border); }
 .gate-form { display: grid; gap: 12px; align-content: start; }
 .gate-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
@@ -377,6 +387,7 @@ legend { padding: 0; margin-bottom: 2px; font-size: 13.5px; font-weight: 600; co
 .msg-tags { display: flex; flex-wrap: wrap; gap: 6px; }
 .msg-body { font-size: 14.5px; color: var(--text); }
 .msg-foot { display: flex; flex-wrap: wrap; gap: 4px 10px; font-size: 12.5px; color: var(--text-3); }
+.msg-unread { color: var(--attn-text); font-weight: 600; }
 .verdict { display: grid; gap: 8px; padding: 12px; border-radius: var(--radius-sm); background: var(--surface-2); border: 1px solid var(--border); }
 .verdict-head { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; font-size: 13.5px; color: var(--text-3); }
 .changes { list-style: decimal; padding-left: 24px; display: grid; gap: 4px; font-size: 14.5px; }
@@ -386,6 +397,9 @@ legend { padding: 0; margin-bottom: 2px; font-size: 13.5px; font-weight: 600; co
 .info { padding: 16px; display: grid; gap: 14px; }
 .info .kv { grid-template-columns: 8em minmax(0, 1fr); }
 .brief { font-size: 14px; color: var(--text-2); }
+.caps-edit { display: grid; gap: 12px; padding-top: 14px; border-top: 1px solid var(--border); }
+.caps-fields { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 12px; }
+.field-hint { font-size: 12.5px; color: var(--text-3); }
 .presence { display: grid; }
 .presence li { display: flex; align-items: center; gap: 10px; padding: 10px 0; border-top: 1px solid var(--border); }
 .presence li:first-child { border-top: 0; padding-top: 2px; }
@@ -410,9 +424,12 @@ legend { padding: 0; margin-bottom: 2px; font-size: 13.5px; font-weight: 600; co
 
 /* Spike */
 .wake-grid { display: grid; gap: 12px; }
-@media (min-width: 760px) { .wake-grid { grid-template-columns: minmax(0, 1fr) minmax(0, 2fr); } }
+@media (min-width: 600px) {
+  .wake-grid { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+  .wake-grid .wake-text { grid-column: 1 / -1; }
+}
 .event-summary { display: flex; flex-wrap: wrap; gap: 6px; }
-.event-summary .chip { font-family: var(--mono); font-weight: 500; }
+.event-summary .chip { font-family: var(--mono); font-weight: 500; white-space: normal; overflow-wrap: anywhere; max-width: 100%; }
 .event-summary .chip b { margin-left: 6px; font-family: var(--font); }
 .event-list { display: grid; gap: 8px; }
 .event { padding: 12px 16px; display: grid; gap: 8px; }
@@ -544,14 +561,24 @@ legend { padding: 0; margin-bottom: 2px; font-size: 13.5px; font-weight: 600; co
       </div>
       <div id="wake-panel" class="card panel" data-human-only hidden>
         <h2 class="panel-title">Queue a wake</h2>
-        <p class="panel-sub">Delivered to the next session that polls for wakes — or only to the session you name.</p>
+        <p class="panel-sub">Only sessions running with the chosen role's token get it: the next one that polls, or only the session you name.</p>
         <div class="wake-grid">
           <div class="field">
-            <label for="wake-session">Session ID (optional)</label>
-            <input id="wake-session" class="input mono" type="text" list="session-ids" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="Any session">
-            <datalist id="session-ids"></datalist>
+            <label for="wake-role">Role</label>
+            <select id="wake-role" class="input" required>
+              <option value="">Choose a role</option>
+              <option value="orchestrator">Orchestrator</option>
+              <option value="creative-director">Creative Director</option>
+              <option value="developer">Full-Stack Developer</option>
+              <option value="human">Human</option>
+            </select>
           </div>
           <div class="field">
+            <label for="wake-session">Session ID (optional)</label>
+            <input id="wake-session" class="input mono" type="text" list="session-ids" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="Next session to poll">
+            <datalist id="session-ids"></datalist>
+          </div>
+          <div class="field wake-text">
             <label for="wake-text">Text</label>
             <textarea id="wake-text" class="input" rows="2" placeholder="e.g. Check your relay inbox."></textarea>
           </div>
@@ -586,7 +613,11 @@ legend { padding: 0; margin-bottom: 2px; font-size: 13.5px; font-weight: 600; co
 (() => {
   const TOKEN_KEY = 'agent-relay-token';
   const REFRESH_MS = 10000;
+  const REQUEST_TIMEOUT_MS = 15000; // a GET that never answers must not stop the refresh loop
+  const BUILD_ID = /^b-[a-z2-7]{10}$/;
+  const CAP_LIMITS = { max_messages: [1, 10000], max_review_rounds: [1, 20] };
   const CLOSED = new Set(['shipped', 'cancelled']);
+  const CLOSED_TASK = new Set(['done', 'cancelled']);
   const BUILD_STATUS = {
     planning: ['Planning', 'purple'],
     awaiting_plan_approval: ['Awaiting plan approval', 'amber'],
@@ -625,6 +656,7 @@ legend { padding: 0; margin-bottom: 2px; font-size: 13.5px; font-weight: 600; co
     halted: 'Halted',
     secret_detected: 'Looks like a secret',
     network: 'Offline',
+    timeout: 'No answer',
     bad_response: 'Relay error',
   };
   const ICONS = {
@@ -658,6 +690,7 @@ legend { padding: 0; margin-bottom: 2px; font-size: 13.5px; font-weight: 600; co
     auditOpen: false,
     confirmRun: null,
     pendingToken: null,
+    spikeSessions: [],
   };
   const drafts = new Map();
   const expanded = new Set();
@@ -831,10 +864,23 @@ legend { padding: 0; margin-bottom: 2px; font-size: 13.5px; font-weight: 600; co
       init.headers['Content-Type'] = 'application/json';
       init.body = JSON.stringify(body);
     }
+    // Reads give up after a while; writes are left to finish, so a decision is never sent twice by a retry.
+    const abort = method === 'GET' ? new AbortController() : null;
+    if (abort) init.signal = abort.signal;
+    const timer = abort ? setTimeout(() => abort.abort(), REQUEST_TIMEOUT_MS) : 0;
     let res;
-    try { res = await fetch(path, init); } catch { throw new ApiError('network', "Can't reach the relay. Check your connection."); }
     let payload = null;
-    try { payload = await res.json(); } catch { /* not JSON */ }
+    try {
+      try { res = await fetch(path, init); } catch {
+        if (abort?.signal.aborted) throw new ApiError('timeout', 'The relay did not answer in time.');
+        throw new ApiError('network', "Can't reach the relay. Check your connection.");
+      }
+      try { payload = await res.json(); } catch {
+        if (abort?.signal.aborted) throw new ApiError('timeout', 'The relay did not answer in time.');
+      }
+    } finally {
+      clearTimeout(timer);
+    }
     const err = payload && typeof payload === 'object' ? payload.error : null;
     if (res.status === 401 || err?.code === 'unauthorized') {
       if (!opts.token && token === state.token) signOut('Your token was not accepted — it may have been rotated. Enter a relay token to continue.');
@@ -871,11 +917,15 @@ legend { padding: 0; margin-bottom: 2px; font-size: 13.5px; font-weight: 600; co
   }
   function loadRoute(route) {
     if (route.view === 'list') return api('GET', '/api/builds?include_closed=1');
-    if (route.view === 'build') return api('GET', `/api/builds/${encodeURIComponent(route.id)}`);
+    if (route.view === 'build') {
+      // A mistyped or truncated link never reaches the relay: it is simply not a build.
+      if (!BUILD_ID.test(route.id)) return Promise.reject(new ApiError('not_found', `No build with ID ${route.id}.`));
+      return api('GET', `/api/builds/${encodeURIComponent(route.id)}`);
+    }
     return isHuman() ? api('GET', '/spike/events?limit=200') : Promise.resolve(null);
   }
 
-  // ---- refresh loop: every 10 s while visible, never overlapping ----
+  // ---- refresh loop: every 10 s while visible, never overlapping; paused while hidden ----
   async function refresh() {
     if (!state.token) return;
     const route = currentRoute();
@@ -892,15 +942,25 @@ legend { padding: 0; margin-bottom: 2px; font-size: 13.5px; font-weight: 600; co
     if (dataRes.status === 'fulfilled') {
       state.data = dataRes.value;
       render();
-    } else if (route.view === 'build' && failure.code === 'not_found') {
+    } else if (route.view === 'build' && noSuchBuild(failure)) {
       renderNotFound(route.id);
     }
-    showLoadError(dataRes.status === 'rejected' && failure.code !== 'not_found' ? failure : null);
+    showLoadError(dataRes.status === 'rejected' && !(route.view === 'build' && noSuchBuild(failure)) ? failure : null);
     schedule();
   }
-  function schedule() {
+  // The relay answers a malformed build id with invalid_input and an unknown one with not_found.
+  const noSuchBuild = (e) => e?.code === 'not_found' || e?.code === 'invalid_input';
+  function schedule(delay = REFRESH_MS) {
     clearTimeout(state.timer);
-    state.timer = setTimeout(() => { if (document.visibilityState === 'visible') refresh(); }, REFRESH_MS);
+    state.timer = setTimeout(() => { if (document.visibilityState === 'visible') refresh(); }, delay);
+  }
+  // Back on screen: refresh now if a poll is due, else re-arm the timer for the rest of the interval,
+  // so polling can never stay stopped while the page is visible.
+  function resumePolling() {
+    if (!state.token || document.visibilityState !== 'visible') return;
+    const since = Date.now() - state.lastAttempt;
+    if (since >= REFRESH_MS || since < 0) refresh();
+    else schedule(REFRESH_MS - since);
   }
   function showLoadError(e) {
     const box = $('load-error');
@@ -958,6 +1018,7 @@ legend { padding: 0; margin-bottom: 2px; font-size: 13.5px; font-weight: 600; co
     for (const el of document.querySelectorAll('[data-human-only]')) el.hidden = !human;
     if (!human) $('new-build').hidden = true;
     $('version').textContent = me?.version ? `Agent Relay v${me.version}` : '';
+    for (const opt of $('wake-role').options) if (opt.value) opt.textContent = roleName(opt.value);
     const halted = me?.halted;
     const on = halted === true || (halted && typeof halted === 'object' && halted.global === true);
     $('halt-banner').hidden = !on;
@@ -1049,8 +1110,13 @@ legend { padding: 0; margin-bottom: 2px; font-size: 13.5px; font-weight: 600; co
   // ---- build detail ----
   const isPendingGate = (g) => g.status === 'pending';
   function renderNotFound(id) {
+    const shown = id.length > 80 ? `${id.slice(0, 79)}…` : id;
     $('build').replaceChildren(h('div', { class: 'detail' }, backLink(),
-      h('div', { class: 'empty' }, h('p', {}, 'No build with ID ', h('span', { class: 'mono', text: id }), '.'))));
+      h('div', { class: 'empty not-found' },
+        h('h1', { class: 'not-found-title', text: 'No such build' }),
+        h('p', {}, 'No build with ID ', h('span', { class: 'mono', text: shown }), '.'),
+        BUILD_ID.test(id) ? null : h('p', {}, 'Build links end in an ID like ', h('span', { class: 'mono', text: 'b-k3j5x2m7qa' }), '. Check the link you followed.'),
+        h('a', { class: 'btn', href: '#' }, icon('back'), 'Back to all builds'))));
   }
   function backLink() {
     return h('a', { class: 'back', href: '#' }, icon('back'), 'All builds');
@@ -1063,21 +1129,86 @@ legend { padding: 0; margin-bottom: 2px; font-size: 13.5px; font-weight: 600; co
     const pending = gates.filter(isPendingGate);
     const decided = gates.filter((g) => !isPendingGate(g)).sort((a, b) => idNum(b.id) - idNum(a.id));
     const taskById = new Map(tasks.map((t) => [t.id, t]));
+    // Latest verdict per task, and the latest change list per task (what an escalation is about).
     const verdictByTask = new Map();
-    for (const v of arr(result?.verdicts).slice().sort((a, b) => idNum(a.id) - idNum(b.id))) verdictByTask.set(v.task_id, v);
+    const changesByTask = new Map();
+    for (const v of arr(result?.verdicts).slice().sort((a, b) => idNum(a.id) - idNum(b.id))) {
+      verdictByTask.set(v.task_id, v);
+      if (v.verdict === 'changes_requested') changesByTask.set(v.task_id, v);
+    }
     const messages = arr(result?.messages).slice().sort((a, b) => (b.seq ?? idNum(b.id)) - (a.seq ?? idNum(a.id)));
 
     $('build').replaceChildren(h('div', { class: 'detail' },
       backLink(),
       detailHeader(build, buildId),
-      build.status === 'halted' ? h('div', { class: 'callout', role: 'note' }, icon('pause'),
-        h('div', {}, h('strong', { text: 'This build is halted.' }),
-          h('span', { text: build.halt_reason ? `Reason: ${build.halt_reason}.` : 'No reason was given.' }),
-          build.status_before_halt ? h('span', { text: ` Resuming returns it to ${(BUILD_STATUS[build.status_before_halt]?.[0] || humanize(build.status_before_halt)).toLowerCase()}.` }) : null)) : null,
-      pending.length ? gatesSection(buildId, pending, taskById) : null,
+      build.status === 'halted' ? haltCallout(build, buildId) : null,
+      pending.length ? gatesSection(buildId, pending, taskById, changesByTask) : null,
       h('div', { class: 'detail-grid' },
-        h('div', { class: 'detail-main' }, tasksSection(tasks, verdictByTask), messagesSection(buildId, messages)),
-        h('div', { class: 'detail-aside' }, infoSection(build), presenceSection(arr(result?.threads)), historySection(decided, taskById), auditSection(arr(result?.audit))))));
+        h('div', { class: 'detail-main' }, tasksSection(tasks, verdictByTask, taskById), messagesSection(buildId, messages)),
+        h('div', { class: 'detail-aside' }, infoSection(build, buildId), presenceSection(arr(result?.threads)), historySection(decided, taskById), auditSection(arr(result?.audit))))));
+  }
+  const capsOf = (build) => (build.caps && typeof build.caps === 'object' ? build.caps : null);
+  /** Halted by the message cap, or halted while at it: resuming alone would trip the cap again. */
+  function isCapHalt(build) {
+    const caps = capsOf(build);
+    return build.halt_reason === 'message cap reached'
+      || (caps != null && Number.isFinite(caps.max_messages) && (build.message_count ?? 0) >= caps.max_messages);
+  }
+  function haltCallout(build, buildId) {
+    const before = build.status_before_halt;
+    return h('div', { class: 'callout', role: 'note' }, icon('pause'),
+      h('div', { class: 'callout-body' }, h('strong', { text: 'This build is halted.' }),
+        h('span', { text: build.halt_reason ? `Reason: ${build.halt_reason}.` : 'No reason was given.' }),
+        before ? h('span', { text: ` Resuming returns it to ${(BUILD_STATUS[before]?.[0] || humanize(before)).toLowerCase()}.` }) : null,
+        isHuman() && isCapHalt(build) && capsOf(build) ? raiseCapForm(build, buildId) : null));
+  }
+  function raiseCapForm(build, buildId) {
+    const key = `${buildId}:raise`;
+    const draftKey = `raise:${buildId}`;
+    const busy = state.busy.has(key);
+    const used = build.message_count ?? 0;
+    const cap = capsOf(build).max_messages;
+    const [, most] = CAP_LIMITS.max_messages;
+    const inputId = `raise-${slug(buildId)}`;
+    const input = h('input', {
+      id: inputId, class: 'input', type: 'number', inputmode: 'numeric', min: Math.min(most, used + 1), max: most, step: 1,
+      'data-draft': draftKey, 'data-key': draftKey, value: drafts.get(draftKey) ?? String(Math.min(most, Math.max(cap, used) + 100)), disabled: busy,
+    });
+    const btn = h('button', { type: 'button', class: 'btn btn-primary', 'data-key': `control:raise`, disabled: busy }, icon('play'), 'Raise cap and resume');
+    btn.addEventListener('click', () => raiseCapAndResume(buildId, used, inputId));
+    const error = h('p', { class: 'form-error', role: 'alert' });
+    setError(error, state.errors.get(key));
+    return h('div', { class: 'cap-form' },
+      h('label', { for: inputId, text: `New message cap (${used} of ${cap} agent messages used)` }),
+      h('div', { class: 'cap-row' }, input, btn), error);
+  }
+  async function raiseCapAndResume(buildId, used, inputId) {
+    const key = `${buildId}:raise`;
+    if (state.busy.has(key)) return;
+    const n = Number($(inputId)?.value);
+    const [, most] = CAP_LIMITS.max_messages;
+    if (!Number.isInteger(n) || n <= used || n > most) {
+      state.errors.set(key, { code: 'invalid_input', message: used >= most ? `The cap is already at its limit of ${most}.` : `Enter a whole number from ${used + 1} to ${most}.` });
+      render(true);
+      $(inputId)?.focus();
+      return;
+    }
+    state.busy.add(key);
+    state.errors.delete(key);
+    render(true);
+    try {
+      await api('POST', '/api/call/build_control', { build_id: buildId, action: 'set_caps', caps: { max_messages: n } });
+      await api('POST', '/api/call/build_control', { build_id: buildId, action: 'resume' });
+      drafts.delete(`raise:${buildId}`);
+      toast(`Message cap raised to ${n} — build resumed`);
+    } catch (e) {
+      if (e.code === 'unauthorized') return;
+      state.errors.set(key, e);
+    } finally {
+      state.busy.delete(key);
+    }
+    render(true);
+    refresh();
   }
   function detailHeader(build, buildId) {
     const controls = [];
@@ -1120,16 +1251,35 @@ legend { padding: 0; margin-bottom: 2px; font-size: 13.5px; font-weight: 600; co
     if (gate.kind === 'final_signoff') return 'Approve to mark the build shipped. Reject to send it back into progress.';
     if (gate.kind === 'escalation') {
       const t = task ? `${task.id} hit` : 'A task hit';
-      return `${t} its review cap. Approve to grant extra review rounds; reject to hand the task back to the Orchestrator.`;
+      return `${t} its review cap. Approve to grant extra review rounds; reject to cancel the task (the Orchestrator can plan a narrower one).`;
     }
     return '';
   }
-  function gatesSection(buildId, pending, taskById) {
+  function gatesSection(buildId, pending, taskById, changesByTask) {
     return h('section', { class: 'gates', 'aria-labelledby': 'gates-title' },
       h('h2', { id: 'gates-title', class: 'section-title' }, icon('flag'), isHuman() ? 'Needs your decision' : `Waiting for ${humanName()}`, count(pending.length)),
-      pending.map((g) => gateCard(buildId, g, g.task_id ? taskById.get(g.task_id) : null)));
+      pending.map((g) => gateCard(buildId, g, g.task_id ? taskById.get(g.task_id) : null,
+        g.kind === 'escalation' && g.task_id ? changesByTask.get(g.task_id) : null)));
   }
-  function gateCard(buildId, gate, task) {
+  /** The reviewer's latest change list: what is still wrong with the task being escalated. */
+  function outstandingChanges(key, verdict) {
+    const changes = arr(verdict?.changes);
+    if (!changes.length) return null;
+    const LIMIT = 5;
+    const open = expanded.has(key);
+    const shown = open || changes.length <= LIMIT + 1 ? changes : changes.slice(0, LIMIT);
+    const from = [verdict.round != null ? `round ${verdict.round}` : null, verdict.reviewer ? `from ${roleLabel(verdict.reviewer)}` : null].filter(Boolean).join(', ');
+    const box = h('div', { class: 'gate-changes' },
+      h('p', { class: 'gate-changes-head', text: `Still to fix${from ? ` (${from})` : ''}` }),
+      h('ol', { class: 'changes' }, shown.map((c) => h('li', { class: 'prose', text: String(c) }))));
+    if (changes.length > LIMIT + 1) {
+      const btn = h('button', { type: 'button', class: 'more', 'data-key': `more:${key}`, text: open ? 'Show fewer' : `Show all ${changes.length} changes` });
+      btn.addEventListener('click', () => { if (open) expanded.delete(key); else expanded.add(key); render(true); });
+      box.append(btn);
+    }
+    return box;
+  }
+  function gateCard(buildId, gate, task, changesVerdict) {
     const key = `${buildId}:${gate.id}`;
     const busy = state.busy.has(key);
     const info = h('div', { class: 'gate-info' },
@@ -1137,6 +1287,7 @@ legend { padding: 0; margin-bottom: 2px; font-size: 13.5px; font-weight: 600; co
       task ? h('p', { class: 'gate-task' }, h('span', { class: 'mono task-id', text: task.id }), task.title || '',
         task.round != null ? h('span', { class: 'muted', text: ` · round ${task.round} of ${task.max_rounds ?? '?'}` }) : null) : null,
       gate.summary ? collapsible(`gate:${key}`, String(gate.summary), 'gate-summary', 700) : null,
+      changesVerdict ? outstandingChanges(`changes:${key}`, changesVerdict) : null,
       linkList(gate.links),
       h('p', { class: 'gate-meta' }, 'Requested', gate.requested_by ? ` by ${roleLabel(gate.requested_by)}` : '', ' ', timeEl(gate.requested_at)));
     const hint = gateHint(gate, task);
@@ -1195,28 +1346,37 @@ legend { padding: 0; margin-bottom: 2px; font-size: 13.5px; font-weight: 600; co
     refresh();
   }
 
-  function tasksSection(tasks, verdictByTask) {
+  function tasksSection(tasks, verdictByTask, taskById) {
     return h('section', { class: 'block', 'aria-labelledby': 'tasks-title' },
       h('h2', { id: 'tasks-title', class: 'section-title' }, 'Tasks', count(tasks.length)),
       tasks.length
-        ? h('ol', { class: 'task-list' }, tasks.map((t) => h('li', {}, taskCard(t, verdictByTask.get(t.id)))))
+        ? h('ol', { class: 'task-list' }, tasks.map((t) => h('li', {}, taskCard(t, verdictByTask.get(t.id), taskById))))
         : h('p', { class: 'empty', text: 'No tasks yet. The Orchestrator adds them while planning.' }));
   }
-  function taskCard(t, verdict) {
-    const open = !['done', 'cancelled'].includes(t.status);
+  /** The open dependencies a task waits on: the relay's ready/waiting_on, or worked out here for an older relay. */
+  function waitingOn(t, taskById) {
+    if (typeof t.ready === 'boolean') return t.ready ? [] : arr(t.waiting_on).length ? arr(t.waiting_on) : arr(t.depends_on);
+    return arr(t.depends_on).filter((id) => { const dep = taskById.get(id); return dep && !CLOSED_TASK.has(dep.status); });
+  }
+  function taskCard(t, verdict, taskById) {
+    const open = !CLOSED_TASK.has(t.status);
+    const waiting = open ? waitingOn(t, taskById) : [];
     const badges = [];
+    if (waiting.length) badges.push(h('span', { class: 'badge tone-gray', title: 'Starts when these tasks are done or cancelled', text: `Waiting on ${waiting.join(', ')}` }));
     if (t.escalated) badges.push(h('span', { class: 'badge tone-amber', text: 'Escalated' }));
     if (t.stalled) badges.push(h('span', { class: 'badge tone-red', text: 'Stalled' }));
-    if (open && t.owner && t.owner === state.me?.role) badges.push(h('span', { class: 'badge tone-blue', text: 'Waiting on you' }));
+    if (open && !waiting.length && t.owner && t.owner === state.me?.role) badges.push(h('span', { class: 'badge tone-blue', text: 'Waiting on you' }));
     const last = parseTime(t.last_activity_at);
+    // Idle time only means something for a task its owner can work on now (that is what gets nudged).
+    const idling = open && t.owner && !waiting.length;
     const activity = last == null ? h('span', { class: 'muted', text: '—' })
-      : open && t.owner ? h('span', { title: fmtDateTime.format(last), text: `Idle ${spanText(Date.now() - last)}` })
+      : idling ? h('span', { title: fmtDateTime.format(last), text: `Idle ${spanText(Date.now() - last)}` })
         : timeEl(last);
     const kv = [
       ['Owner', t.owner ? roleEl(t.owner) : h('span', { class: 'muted', text: 'Nobody' })],
       ['Assignee', t.assignee ? roleEl(t.assignee) : h('span', { class: 'muted', text: '—' })],
       ['Reviewer', t.reviewer ? roleEl(t.reviewer) : h('span', { class: 'muted', text: 'None' })],
-      [open && t.owner ? 'Activity' : 'Last activity', activity],
+      [idling ? 'Activity' : 'Last activity', activity],
     ];
     if (t.reviewer || t.round) kv.splice(3, 0, ['Round', h('span', { text: `${t.round ?? 0} of ${t.max_rounds ?? '—'}` })]);
     if (arr(t.depends_on).length) kv.push(['Depends on', h('span', { class: 'mono', text: t.depends_on.join(', ') })]);
@@ -1276,12 +1436,13 @@ legend { padding: 0; margin-bottom: 2px; font-size: 13.5px; font-weight: 600; co
         h('span', { class: 'mono', text: m.id }),
         timeEl(m.created_at),
         m.reply_to ? h('span', {}, 'reply to ', h('span', { class: 'mono', text: m.reply_to })) : null,
-        m.read_at ? null : h('span', { text: 'unread' })));
+        // Read state is the recipient's inbox; the page itself never marks anything read, so the viewer's own mail has none.
+        m.read_at || !m.to || m.to === me ? null : h('span', { class: 'msg-unread', text: `unread by ${roleName(m.to)}` })));
   }
 
-  function infoSection(build) {
+  function infoSection(build, buildId) {
     const gates = build.gates && typeof build.gates === 'object' ? build.gates : null;
-    const caps = build.caps && typeof build.caps === 'object' ? build.caps : null;
+    const caps = capsOf(build);
     const kv = [];
     if (gates) {
       kv.push(['Plan approval', gates.plan_approval === false ? 'Skipped' : 'Required']);
@@ -1297,7 +1458,85 @@ legend { padding: 0; margin-bottom: 2px; font-size: 13.5px; font-weight: 600; co
       h('h2', { id: 'info-title', class: 'section-title', text: 'About this build' }),
       h('div', { class: 'card info' },
         build.brief ? h('div', {}, h('span', { class: 'bc-label', text: 'Brief' }), collapsible(`brief:${build.build_id}`, String(build.brief), 'brief', 280)) : null,
-        kv.length ? h('dl', { class: 'kv' }, kv.map(([k, v]) => [h('dt', { text: k }), h('dd', {}, v)])) : null));
+        kv.length ? h('dl', { class: 'kv' }, kv.map(([k, v]) => [h('dt', { text: k }), h('dd', {}, v)])) : null,
+        caps && isHuman() && !CLOSED.has(build.status) ? capsEditor(build, buildId, caps) : null));
+  }
+  /** "Edit caps": build_control set_caps for the message cap and the review rounds per task. */
+  function capsEditor(build, buildId, caps) {
+    const key = `${buildId}:caps`;
+    const openKey = `caps:${buildId}`;
+    const formId = `caps-${slug(buildId)}`;
+    if (!expanded.has(openKey)) {
+      const edit = h('button', { type: 'button', class: 'btn btn-sm', 'aria-expanded': 'false', 'aria-controls': formId, 'data-key': 'caps:edit', text: 'Edit caps' });
+      edit.addEventListener('click', () => {
+        expanded.add(openKey);
+        state.errors.delete(key);
+        render(true);
+        $(`${formId}-max_messages`)?.focus();
+      });
+      return h('div', {}, edit);
+    }
+    const busy = state.busy.has(key);
+    const field = (name, label, hint) => {
+      const id = `${formId}-${name}`;
+      const draftKey = `capsdraft:${buildId}:${name}`;
+      const [least, most] = CAP_LIMITS[name];
+      return h('div', { class: 'field' },
+        h('label', { for: id, text: label }),
+        h('input', { id, class: 'input', type: 'number', inputmode: 'numeric', min: least, max: most, step: 1, 'data-draft': draftKey, 'data-key': draftKey, value: drafts.get(draftKey) ?? String(caps[name] ?? ''), disabled: busy }),
+        hint ? h('span', { class: 'field-hint', text: hint }) : null);
+    };
+    const cancel = h('button', { type: 'button', class: 'btn', 'data-key': 'caps:cancel', disabled: busy, text: 'Cancel' });
+    cancel.addEventListener('click', () => closeCapsEditor(buildId, true));
+    const save = h('button', { type: 'button', class: 'btn btn-primary', 'data-key': 'caps:save', disabled: busy, text: 'Save caps' });
+    save.addEventListener('click', () => saveCaps(buildId, caps, formId));
+    const error = h('p', { class: 'form-error', role: 'alert' });
+    setError(error, state.errors.get(key));
+    return h('div', { id: formId, class: 'caps-edit', 'aria-busy': busy ? 'true' : null },
+      h('div', { class: 'caps-fields' },
+        field('max_messages', 'Message cap', `${build.message_count ?? 0} agent messages sent`),
+        field('max_review_rounds', 'Review rounds', 'per task, before escalation')),
+      error,
+      h('div', { class: 'panel-actions' }, cancel, save));
+  }
+  function closeCapsEditor(buildId, focusEdit) {
+    expanded.delete(`caps:${buildId}`);
+    state.errors.delete(`${buildId}:caps`);
+    for (const name of Object.keys(CAP_LIMITS)) drafts.delete(`capsdraft:${buildId}:${name}`);
+    render(true);
+    if (focusEdit) document.querySelector('[data-key="caps:edit"]')?.focus();
+  }
+  async function saveCaps(buildId, current, formId) {
+    const key = `${buildId}:caps`;
+    if (state.busy.has(key)) return;
+    const next = {};
+    for (const [name, [least, most]] of Object.entries(CAP_LIMITS)) {
+      const n = Number($(`${formId}-${name}`)?.value);
+      if (!Number.isInteger(n) || n < least || n > most) {
+        state.errors.set(key, { code: 'invalid_input', message: `${name === 'max_messages' ? 'Message cap' : 'Review rounds'}: enter a whole number from ${least} to ${most}.` });
+        render(true);
+        $(`${formId}-${name}`)?.focus();
+        return;
+      }
+      if (n !== current[name]) next[name] = n;
+    }
+    if (!Object.keys(next).length) { closeCapsEditor(buildId, true); return; }
+    state.busy.add(key);
+    state.errors.delete(key);
+    render(true);
+    let saved = false;
+    try {
+      await api('POST', '/api/call/build_control', { build_id: buildId, action: 'set_caps', caps: next });
+      saved = true;
+      toast('Caps updated');
+    } catch (e) {
+      if (e.code === 'unauthorized') return;
+      state.errors.set(key, e);
+    } finally {
+      state.busy.delete(key);
+    }
+    if (saved) closeCapsEditor(buildId, true); else render(true);
+    refresh();
   }
   function presenceSection(threads) {
     const rows = threads.slice().sort((a, b) => (parseTime(lastSeen(b)) || 0) - (parseTime(lastSeen(a)) || 0));
@@ -1356,7 +1595,8 @@ legend { padding: 0; margin-bottom: 2px; font-size: 13.5px; font-weight: 600; co
     }
     const events = arr(result?.events).slice().sort((a, b) => (parseTime(b.received_at ?? b.ts) || 0) - (parseTime(a.received_at ?? a.ts) || 0));
     const sessions = [...new Set(events.map((e) => e.session_id).filter(Boolean))];
-    $('session-ids').replaceChildren(...sessions.map((s) => h('option', { value: s })));
+    state.spikeSessions = events.filter((e) => e.session_id).map((e) => [e.session_id, e.role]);
+    sessionOptions();
     if (!events.length) {
       $('events').replaceChildren(h('p', { class: 'empty', text: 'No spike events yet. Install the spike Mod and start a session.' }));
       return;
@@ -1383,13 +1623,22 @@ legend { padding: 0; margin-bottom: 2px; font-size: 13.5px; font-weight: 600; co
       meta.length ? h('div', { class: 'event-meta' }, meta) : null,
       detail ? collapsible(key, detail, 'event-detail', 360) : null);
   }
+  /** Session ids seen in spike events, offered for the chosen role (every one when no role is chosen yet). */
+  function sessionOptions() {
+    const role = $('wake-role').value;
+    const ids = [...new Set(arr(state.spikeSessions).filter(([, r]) => !role || r === role).map(([id]) => id))];
+    $('session-ids').replaceChildren(...ids.map((s) => h('option', { value: s })));
+  }
   async function queueWake() {
     const btn = $('wake-send');
+    const role = $('wake-role').value;
     const text = $('wake-text').value.trim();
     const sessionId = $('wake-session').value.trim();
     const errorEl = $('wake-error');
+    // A wake goes only to pollers holding that role's token, so the role is never guessed.
+    if (!role) { setError(errorEl, { code: 'invalid_input', message: 'Choose the role whose session should get the wake.' }); $('wake-role').focus(); return; }
     if (!text) { setError(errorEl, { code: 'invalid_input', message: 'Enter the text to send.' }); $('wake-text').focus(); return; }
-    const input = { text };
+    const input = { role, text };
     if (sessionId) input.session_id = sessionId;
     btn.disabled = true;
     setError(errorEl, null);
@@ -1397,7 +1646,7 @@ legend { padding: 0; margin-bottom: 2px; font-size: 13.5px; font-weight: 600; co
       const result = await api('POST', '/spike/wake', input);
       $('wake-text').value = '';
       const id = result?.wake?.id;
-      toast(`Wake ${id ? `${id} ` : ''}queued for ${sessionId || 'any session'}`);
+      toast(`Wake ${id ? `${id} ` : ''}queued for ${roleName(role)}: ${sessionId ? `session ${sessionId}` : 'the next session to poll'}`);
     } catch (e) {
       if (e.code !== 'unauthorized') setError(errorEl, e);
     } finally {
@@ -1571,6 +1820,8 @@ legend { padding: 0; margin-bottom: 2px; font-size: 13.5px; font-weight: 600; co
     $('attention').replaceChildren();
     $('build').replaceChildren();
     $('events').replaceChildren();
+    $('session-ids').replaceChildren();
+    state.spikeSessions = [];
     showSignin(message);
   }
 
@@ -1583,8 +1834,11 @@ legend { padding: 0; margin-bottom: 2px; font-size: 13.5px; font-weight: 600; co
     document.addEventListener('change', (e) => { const k = e.target?.dataset?.draft; if (k) drafts.set(k, e.target.value); });
     window.addEventListener('hashchange', () => { if (state.token) showRoute({ focus: true }); });
     document.addEventListener('visibilitychange', () => {
-      if (document.visibilityState === 'visible' && state.token && Date.now() - state.lastAttempt >= REFRESH_MS) refresh();
+      if (document.visibilityState === 'visible') resumePolling();
+      else clearTimeout(state.timer);
     });
+    window.addEventListener('pageshow', (e) => { if (e.persisted) resumePolling(); });
+    window.addEventListener('online', resumePolling);
 
     $('signin-btn').addEventListener('click', signIn);
     $('token-input').addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); signIn(); } });
@@ -1603,6 +1857,7 @@ legend { padding: 0; margin-bottom: 2px; font-size: 13.5px; font-weight: 600; co
     $('kill-on').addEventListener('click', () => killSwitch(true));
     $('kill-off').addEventListener('click', () => killSwitch(false));
     $('wake-send').addEventListener('click', queueWake);
+    $('wake-role').addEventListener('change', sessionOptions);
     $('confirm-ok').addEventListener('click', confirmOk);
     $('confirm-cancel').addEventListener('click', closeConfirm);
     $('confirm').addEventListener('cancel', () => { state.confirmRun = null; });

@@ -3,41 +3,28 @@ import type { On, Register, Timer } from 'claude-code'
 
 import type { RelayInbox, RelayMemory } from '../types'
 import { Inbox, type InboxHost } from './inbox'
-import { formatForModel, headline, undelivered } from './messages'
-import { type RelayConfig, errorText, readConfig, withTimeout } from './relay'
+import { bandLine, formatForModel } from './messages'
+import { type RelayConfig, errorText, readConfig } from './relay'
 
-/** How often the mod's timer runs; polls happen every poll_seconds within it. */
+/** How often the mod's wake check runs (the start's grace ending, a wake whose turn never started). */
 const TICK_MS = 5_000
-/** How long the session's start waits for the first poll, so the first prompt can carry its messages. */
-const FIRST_POLL_WAIT_MS = 3_000
-/** The most of the exit's short bound spent marking delivered messages read. */
-const EXIT_MARK_READ_MS = 1_500
 
 const EMPTY_INBOX: RelayInbox = { role: null, unread: [], builds: [], halted: null, health: { kind: 'starting' } }
-const EMPTY_MEMORY: RelayMemory = {
-  delivered: [],
-  woken: [],
-  carried: [],
-  recent: [],
-  lastWakeAt: 0,
-  markReadPending: false,
-}
+const EMPTY_MEMORY: RelayMemory = { woken: [], recent: [], lastWakeAt: 0 }
 // Change a tag when that value's fields change: it declines what an earlier version stored.
 const inboxState = atom({ plugin: 'relay-inbox', key: 'inbox' } as const, EMPTY_INBOX, { shape: 'inbox-1' })
-const memoryState = atom({ plugin: 'relay-inbox', key: 'memory' } as const, EMPTY_MEMORY, { shape: 'memory-1' })
+const memoryState = atom({ plugin: 'relay-inbox', key: 'memory' } as const, EMPTY_MEMORY, { shape: 'memory-2' })
 
 export const register: Register = (on, options) => {
-  const config = readConfig(options, 60)
   // Like a missing required field, an unusable value fails the load with a reason the person sees.
-  if (config === undefined) throw new Error('relay-inbox: relay_url must be an http(s) URL and role_token must be set')
-  registerInbox(on, config, options.auto_wake !== false)
+  registerInbox(on, readConfig('relay-inbox', options, 60), options.auto_wake !== false)
 }
 
 function registerInbox(on: On, config: RelayConfig, autoWake: boolean): void {
   const inbox = new Inbox(config, autoWake)
-  // The engine calls of the session.start hook, which the timer and later hooks reuse.
+  // The engine calls of the session.start hook, which the timers and later hooks reuse.
   let host: InboxHost | undefined
-  let loop: Timer | undefined
+  let loops: Timer[] = []
 
   on('session.start', async ($, e, next) => {
     const engine: InboxHost = {
@@ -46,6 +33,14 @@ function registerInbox(on: On, config: RelayConfig, autoWake: boolean): void {
       now: () => $.clock.now(),
       sessionId: () => $.session.id(),
       submit: text => $.prompt.submit({ text }),
+      append: async text => {
+        try {
+          const row = await $.session.append({ message: { type: 'user', content: [{ type: 'text', text }] } })
+          return row.deny === undefined
+        } catch {
+          return false
+        }
+      },
       status: text => $.ui.status(text),
       log: text => $.ui.log(text, { to: 'debug' }),
       inbox: () => read($, inboxState),
@@ -63,23 +58,17 @@ function registerInbox(on: On, config: RelayConfig, autoWake: boolean): void {
         argumentHint: '<text>',
       })
       await inbox.showStatus(engine)
-      await withTimeout(engine, inbox.poll(engine), FIRST_POLL_WAIT_MS)
     } catch (error) {
       $.ui.log(`relay-inbox: ${errorText(error)}`, { to: 'debug' })
     }
-    loop?.cancel()
-    loop = $.clock.every(TICK_MS, () => inbox.background(engine, () => inbox.tick(engine)))
-    inbox.background(engine, () => inbox.tick(engine))
-    return next(e)
-  })
-
-  // A headless run ends right after its turn: mark what it was given read, or the next run gets it again.
-  on('session.end', async ($, e, next) => {
-    const engine = host
-    if (engine !== undefined && (await engine.memory()).markReadPending) {
-      const marked = inbox.markRead(engine).catch(error => $.ui.log(`relay-inbox: ${errorText(error)}`, { to: 'debug' }))
-      await withTimeout(engine, marked, Math.max(0, Math.min(EXIT_MARK_READ_MS, next.budget.remainingMs - 500)))
-    }
+    for (const loop of loops) loop.cancel()
+    loops = [
+      // Polls exactly every poll_seconds; the beat skips while a failing relay backs off.
+      $.clock.every(config.pollMs, () => inbox.background(engine, () => inbox.beat(engine))),
+      $.clock.every(TICK_MS, () => inbox.background(engine, () => inbox.maybeWake(engine))),
+    ]
+    // Not awaited: the first prompt makes its own read, so the session starts at once.
+    inbox.background(engine, () => inbox.beat(engine))
     return next(e)
   })
 
@@ -97,18 +86,19 @@ function registerInbox(on: On, config: RelayConfig, autoWake: boolean): void {
     return next(e)
   })
 
-  // Unread messages ride along with the next prompt as context the model reads, then are marked read.
+  // Unread messages ride along with a prompt that starts a turn: the prompt reads them (marking them
+  // read) and carries exactly what that read returned. A slash command, or a prompt typed over a
+  // running turn, carries nothing: that turn's own inbox calls cover it.
   on('prompt.submit', async ($, e, next) => {
-    if (e.command !== undefined || host === undefined) return next(e)
-    const state = await read($, inboxState)
-    const batch = undelivered(state, await read($, memoryState))
-    if (batch.length === 0) return next(e)
-    const result = await next({ ...e, context: [...(e.context ?? []), formatForModel(batch, state.builds, state.role)] })
-    if (result.drop === undefined) {
-      const engine = host
-      await inbox.delivered(engine, batch, false)
-      inbox.background(engine, () => inbox.markRead(engine))
-    }
+    const engine = host
+    if (e.command !== undefined || e.turnId !== undefined || engine === undefined) return next(e)
+    const taken = await inbox.take(engine)
+    if (taken === undefined) return next(e)
+    const block = formatForModel(taken.messages, taken.builds, taken.role, taken.halted)
+    const result = await next({ ...e, context: [...(e.context ?? []), block] })
+    // They are read on the relay either way: a prompt that did not enter hands them over as a row.
+    if (result.drop !== undefined) inbox.background(engine, () => inbox.handOver(engine, taken))
+    else await inbox.delivered(engine, taken.messages)
     return result
   })
 
@@ -128,18 +118,15 @@ function registerInbox(on: On, config: RelayConfig, autoWake: boolean): void {
     return next(e)
   })
 
-  // The band above the prompt: drawn only while there are unread messages.
+  // The band above the prompt: drawn only while there are unread messages, with the halt holding them back.
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     const state = await read($, inboxState)
     if (e.props.hasSurvey || state.unread.length === 0) return next(e)
-    const newestMessage = state.unread[state.unread.length - 1]
     const { Box, Button, Text } = $.ui.resolve(e)
 
     return (
       <Box>
-        <Text wrap="truncate-end">
-          Relay · {state.unread.length} unread{newestMessage ? ` · ${headline(newestMessage)}` : ''}{' '}
-        </Text>
+        <Text wrap="truncate-end">{bandLine(state)}</Text>
         {/* Read is served by the ui.press hook above. */}
         <Button key="read" label="Read" onPress={() => undefined} />
         <Text> </Text>

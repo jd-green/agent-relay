@@ -20,9 +20,9 @@ One loop end to end: Orchestrator, Creative Director and Full-Stack Developer sh
 |---|---|
 | `src/` | The Worker: MCP server, JSON API, spike endpoints, and the `RelayDO` and `BuildDO` Durable Objects |
 | `src/ui/ledger.html` | The ledger page served at `/`: builds, owners, gates, kill switch, spike view |
-| `protocol/` | `PROTOCOL.md`, pasted into every role Project, and one addendum per role in `roles/` |
+| `protocol/` | `PROTOCOL.md`, pasted into every role Project, one addendum per role in `roles/`, and in `mcp/` the short role digests the relay serves as MCP instructions |
 | `mods/` | Claude Code Mods: `relay-inbox` (wake path and inbox band) and `relay-spike` (milestone 1) |
-| `scripts/` | `gen-dev-vars.mjs` (local tokens) and `put-secrets.sh` (1Password to Wrangler secrets) |
+| `scripts/` | `gen-dev-vars.mjs` (local tokens), `put-secrets.sh` (1Password to Wrangler secrets) and `role-session.sh` (starts a local Claude Code session as one role, for Plan B) |
 | `test/` | Unit tests (`unit/`), end-to-end tests (`e2e/`) and live agent tests (`live/`) |
 | `docs/` | PRD, design contract, setup guide, spike runbook |
 
@@ -35,7 +35,14 @@ npm run dev                     # relay on http://127.0.0.1:8787, ledger page at
 npm test
 ```
 
-To deploy, connect the role Projects and install the Mods, follow [`docs/SETUP.md`](docs/SETUP.md).
+To deploy, connect the role Projects and set up the Mods, follow [`docs/SETUP.md`](docs/SETUP.md). To run a role as a local Claude Code session (one per role, several on one machine):
+
+```sh
+export RELAY_URL=https://<worker>
+scripts/role-session.sh developer   # token via op read; see SETUP §6
+```
+
+Live checks with real Claude sessions (they cost model usage) are described in [`test/live/README.md`](test/live/README.md).
 
 ## Milestones
 

@@ -42,6 +42,55 @@ describe("public routes", () => {
     expect(malformed.status).toBe(400);
     expect(malformed.body.error.code).toBe("invalid_input");
   });
+
+  it("answers any method on an unknown path with 404 JSON that doesn't echo the path", async () => {
+    const probes: [string, string][] = [
+      ["POST", "/register"],
+      ["POST", "/token"],
+      ["GET", "/authorize"],
+      ["GET", "/.well-known/oauth-protected-resource"],
+      ["GET", `/.well-known/oauth-protected-resource/mcp/${TOKENS.developer}`],
+      ["GET", "/.well-known/oauth-authorization-server"],
+      ["GET", "/.well-known/openid-configuration"],
+      ["DELETE", "/nope"],
+      ["PUT", "/nope"],
+      ["PATCH", "/health/x"],
+      ["OPTIONS", "/nope"],
+      ["HEAD", "/nope"],
+      ["POST", "/api"],
+      ["POST", "/mcpx"],
+    ];
+    for (const [method, path] of probes) {
+      const response = await fetchWorker(path, { method, body: method === "POST" ? "{}" : undefined });
+      expect(response.status, `${method} ${path}`).toBe(404);
+      expect(response.headers.get("content-type")).toBe("application/json; charset=utf-8");
+      if (method === "HEAD") continue;
+      const text = await response.text();
+      expect(JSON.parse(text)).toEqual({ ok: false, error: { code: "not_found", message: "no such route" } });
+      expect(text).not.toContain(TOKENS.developer);
+    }
+  });
+
+  it("decides 404 by path before 405 by method under /api and /spike", async () => {
+    for (const [method, path] of [
+      ["POST", "/api/builds/b-aaaaaaaaaa/tasks"],
+      ["DELETE", "/api/nothing"],
+      ["GET", "/api/call"],
+      ["POST", "/api/call/whoami/extra"],
+      ["POST", "/spike/nope"],
+    ] as [string, string][]) {
+      const { status, body } = await api("human", method, path);
+      expect(status, `${method} ${path}`).toBe(404);
+      expect(body).toEqual({ ok: false, error: { code: "not_found", message: "no such route" } });
+    }
+    // Known routes with the wrong method name the methods they allow.
+    const allowed = async (method: string, path: string) => (await fetchWorker(path, { method, headers: { authorization: `Bearer ${TOKENS.human}` } })).headers.get("allow");
+    expect(await allowed("POST", "/health")).toBe("GET, HEAD");
+    expect(await allowed("DELETE", "/")).toBe("GET, HEAD");
+    expect(await allowed("GET", "/api/call/whoami")).toBe("POST");
+    expect(await allowed("DELETE", "/api/builds")).toBe("GET");
+    expect(await allowed("PUT", "/spike/events")).toBe("GET, POST");
+  });
 });
 
 describe("CORS", () => {
@@ -58,13 +107,26 @@ describe("CORS", () => {
     expect(response.headers.get("access-control-allow-credentials")).toBeNull();
   });
 
-  it("adds CORS headers to API, error and MCP responses", async () => {
+  it("answers preflight requests on /spike", async () => {
+    const response = await fetchWorker("/spike/events", { method: "OPTIONS", headers: { origin: "https://claude.ai", "access-control-request-method": "POST" } });
+    expect(response.status).toBe(204);
+    expect(response.headers.get("access-control-allow-origin")).toBe("*");
+  });
+
+  it("adds CORS headers to API and error responses, never to MCP ones", async () => {
     for (const response of [
       await fetchWorker("/api/me", { headers: { authorization: `Bearer ${TOKENS.human}` } }),
       await fetchWorker("/api/me"),
-      await fetchWorker("/mcp", { method: "POST", headers: { authorization: `Bearer ${TOKENS.human}` }, body: '{"jsonrpc":"2.0","id":1,"method":"ping"}' }),
+      await fetchWorker("/api/nothing", { headers: { authorization: `Bearer ${TOKENS.human}` } }),
+      await fetchWorker("/spike/wake", { headers: { authorization: `Bearer ${TOKENS.human}` } }),
     ]) {
       expect(response.headers.get("access-control-allow-origin")).toBe("*");
+    }
+    for (const response of [
+      await fetchWorker("/mcp", { method: "POST", headers: { authorization: `Bearer ${TOKENS.human}` }, body: '{"jsonrpc":"2.0","id":1,"method":"ping"}' }),
+      await fetchWorker("/mcp", { method: "OPTIONS", headers: { origin: "https://claude.ai", "access-control-request-method": "POST" } }),
+    ]) {
+      expect(response.headers.get("access-control-allow-origin")).toBeNull();
     }
   });
 });

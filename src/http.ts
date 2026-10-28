@@ -2,7 +2,17 @@ import page from "./ui/ledger.html";
 import { authenticate, bearerToken } from "./auth";
 import { loadConfig } from "./config";
 import { ERROR_STATUS, RelayError, fail, type ErrorCode } from "./errors";
-import { RPC_INVALID_REQUEST, RPC_PARSE_ERROR, RPC_UNAUTHORIZED, handleRpcPayload, rpcError } from "./mcp";
+import {
+  ASSUMED_PROTOCOL_VERSION,
+  RPC_INTERNAL_ERROR,
+  RPC_INVALID_REQUEST,
+  RPC_PARSE_ERROR,
+  RPC_UNAUTHORIZED,
+  SUPPORTED_PROTOCOL_VERSIONS,
+  handleRpcPayload,
+  isSupportedProtocolVersion,
+  rpcError,
+} from "./mcp";
 import { enabledTokens, type Role } from "./roles";
 import { SpikeEventInput, WakeInput, describeIssues } from "./schemas";
 import { assertNoSecrets } from "./secrets";
@@ -13,11 +23,18 @@ import { NAME, VERSION } from "./version";
 const MAX_BODY_BYTES = 1_000_000;
 const MAX_SPIKE_DETAIL_BYTES = 4096;
 
+// CORS covers the JSON API and the spike endpoints. /mcp sends none: MCP clients are not browsers.
 const CORS_HEADERS = {
   "access-control-allow-origin": "*",
   "access-control-allow-methods": "GET, POST, DELETE, OPTIONS",
   "access-control-allow-headers": "Authorization, Content-Type, Accept, Mcp-Protocol-Version, Mcp-Session-Id",
   "access-control-max-age": "86400",
+};
+
+const JSON_HEADERS = {
+  "content-type": "application/json; charset=utf-8",
+  "cache-control": "no-store",
+  "x-content-type-options": "nosniff",
 };
 
 const PAGE_HEADERS = {
@@ -30,17 +47,20 @@ const PAGE_HEADERS = {
   "cache-control": "no-cache",
 };
 
+/** Routes outside /mcp, /api and /spike/; they answer GET and HEAD only. */
+const PAGE_ROUTES = new Set(["/", "/health", "/spike"]);
+
+// RFC 6750: a presented token that doesn't authenticate gets error="invalid_token".
+const MCP_CHALLENGE = 'Bearer realm="agent-relay"';
+const MCP_INVALID_TOKEN_CHALLENGE = `${MCP_CHALLENGE}, error="invalid_token", error_description="unknown or rotated relay token"`;
+
 function json(body: unknown, status = 200, extra: Record<string, string> = {}): Response {
-  return new Response(JSON.stringify(body), {
-    status,
-    headers: {
-      "content-type": "application/json; charset=utf-8",
-      "cache-control": "no-store",
-      "x-content-type-options": "nosniff",
-      ...CORS_HEADERS,
-      ...extra,
-    },
-  });
+  return new Response(JSON.stringify(body), { status, headers: { ...JSON_HEADERS, ...CORS_HEADERS, ...extra } });
+}
+
+/** A JSON-RPC response on /mcp (no CORS headers). */
+function mcpJson(body: unknown, status = 200, extra: Record<string, string> = {}): Response {
+  return new Response(JSON.stringify(body), { status, headers: { ...JSON_HEADERS, ...extra } });
 }
 
 function ok(result: unknown): Response {
@@ -51,8 +71,13 @@ function errorResponse(code: ErrorCode, message: string): Response {
   return json({ ok: false, error: { code, message } }, ERROR_STATUS[code]);
 }
 
-function methodNotAllowed(allow: string): Response {
-  return new Response(null, { status: 405, headers: { allow, ...CORS_HEADERS } });
+/** Unknown routes never echo the path: a /mcp/<token> probe would put the token in the reply. */
+function notFound(): Response {
+  return errorResponse("not_found", "no such route");
+}
+
+function methodNotAllowed(allow: string, cors = true): Response {
+  return new Response(null, { status: 405, headers: { allow, ...(cors ? CORS_HEADERS : {}) } });
 }
 
 const byteLength = (text: string) => new TextEncoder().encode(text).length;
@@ -100,22 +125,32 @@ async function requireRole(env: Env, token: string | null): Promise<Role> {
 export async function handleRequest(request: Request, env: Env): Promise<Response> {
   const url = new URL(request.url);
   const path = url.pathname.replace(/\/+$/, "") || "/";
-  if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: CORS_HEADERS });
+
+  if (path === "/mcp" || path.startsWith("/mcp/")) {
+    try {
+      return await handleMcp(request, env, url, path);
+    } catch (err) {
+      console.error("unhandled MCP error", err);
+      return mcpJson(rpcError(null, RPC_INTERNAL_ERROR, "Internal error"), 500);
+    }
+  }
 
   try {
-    if (path === "/mcp" || path.startsWith("/mcp/")) return await handleMcp(request, env, path);
-    if (path.startsWith("/api/")) return await handleApi(request, env, url, path);
-    if (path.startsWith("/spike/")) return await handleSpike(request, env, url, path);
-    if (request.method !== "GET" && request.method !== "HEAD") return methodNotAllowed("GET");
+    if (path.startsWith("/api/") || path.startsWith("/spike/")) {
+      if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: CORS_HEADERS });
+      return path.startsWith("/api/") ? await handleApi(request, env, url, path) : await handleSpike(request, env, url, path);
+    }
+    // 404 is decided by the path before 405 by the method, so OAuth discovery probes
+    // (POST /register, GET /.well-known/...) get a plain not_found.
+    if (!PAGE_ROUTES.has(path)) return notFound();
+    if (request.method !== "GET" && request.method !== "HEAD") return methodNotAllowed("GET, HEAD");
     switch (path) {
       case "/":
         return new Response(page, { headers: PAGE_HEADERS });
       case "/health":
         return json({ ok: true, name: NAME, version: VERSION });
-      case "/spike":
-        return Response.redirect(new URL("/#spike", url).toString(), 302);
       default:
-        return errorResponse("not_found", `no route for ${path}`);
+        return Response.redirect(new URL("/#spike", url).toString(), 302);
     }
   } catch (err) {
     if (err instanceof RelayError) return errorResponse(err.code, err.message);
@@ -126,31 +161,64 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
 
 // ---------------------------------------------------------------- MCP transport
 
-async function handleMcp(request: Request, env: Env, path: string): Promise<Response> {
-  if (request.method !== "POST") return methodNotAllowed("POST");
+/** True when the request has no Origin header or its Origin is the relay's own. */
+// Claude's own web origins, in case a connector request is ever proxied with one.
+const CLAUDE_ORIGINS = new Set(["https://claude.ai", "https://claude.com"]);
+
+function sameOriginOrNone(request: Request, url: URL): boolean {
+  const origin = request.headers.get("origin");
+  if (origin === null) return true;
+  try {
+    const parsed = new URL(origin).origin;
+    return parsed === url.origin || CLAUDE_ORIGINS.has(parsed);
+  } catch {
+    return false;
+  }
+}
+
+async function handleMcp(request: Request, env: Env, url: URL, path: string): Promise<Response> {
+  // Streamable HTTP: servers MUST validate Origin (DNS rebinding). MCP clients send none; a page on
+  // another site gets 403.
+  if (!sameOriginOrNone(request, url)) {
+    return mcpJson(rpcError(null, RPC_INVALID_REQUEST, "Forbidden: cross-origin requests are not allowed"), 403);
+  }
+  if (request.method !== "POST") return methodNotAllowed("POST", false);
   // claude.ai custom connectors cannot always set headers, so the token may also be the last path segment.
-  const pathToken = path.startsWith("/mcp/") ? decodeSegment(path.slice("/mcp/".length)) : null;
-  const role = (await authenticate(env, bearerToken(request))) ?? (await authenticate(env, pathToken));
+  const pathSegment = path.startsWith("/mcp/") ? path.slice("/mcp/".length) : "";
+  const headerToken = bearerToken(request);
+  const role = (await authenticate(env, headerToken)) ?? (await authenticate(env, decodeSegment(pathSegment)));
   if (!role) {
-    return json(rpcError(null, RPC_UNAUTHORIZED, "Unauthorized: missing or unknown token"), 401, {
-      "www-authenticate": 'Bearer realm="agent-relay"',
+    const presented = headerToken !== null || pathSegment !== "";
+    return mcpJson(rpcError(null, RPC_UNAUTHORIZED, "Unauthorized: missing or unknown token"), 401, {
+      "www-authenticate": presented ? MCP_INVALID_TOKEN_CHALLENGE : MCP_CHALLENGE,
     });
   }
 
+  const requestedVersion = request.headers.get("mcp-protocol-version");
+  if (requestedVersion !== null && !isSupportedProtocolVersion(requestedVersion)) {
+    const supported = SUPPORTED_PROTOCOL_VERSIONS.join(", ");
+    return mcpJson(rpcError(null, RPC_INVALID_REQUEST, `Bad Request: unsupported MCP-Protocol-Version; supported: ${supported}`), 400);
+  }
+
   const text = await request.text();
-  if (byteLength(text) > MAX_BODY_BYTES) return json(rpcError(null, RPC_INVALID_REQUEST, "Request too large"), 400);
+  if (byteLength(text) > MAX_BODY_BYTES) return mcpJson(rpcError(null, RPC_INVALID_REQUEST, "Request too large"), 400);
   let payload: unknown;
   try {
     payload = JSON.parse(text);
   } catch {
-    return json(rpcError(null, RPC_PARSE_ERROR, "Parse error"), 400);
+    return mcpJson(rpcError(null, RPC_PARSE_ERROR, "Parse error"), 400);
   }
   const ctx: ToolContext = { env, config: loadConfig(env), role };
-  const response = await handleRpcPayload(ctx, payload);
-  return response === null ? new Response(null, { status: 202, headers: CORS_HEADERS }) : json(response);
+  const reply = await handleRpcPayload(ctx, payload, requestedVersion ?? ASSUMED_PROTOCOL_VERSION);
+  return reply.body === null ? new Response(null, { status: 202 }) : mcpJson(reply.body, reply.status);
 }
 
 // ---------------------------------------------------------------- JSON API
+
+interface ApiRoute {
+  method: "GET" | "POST";
+  run: () => Promise<unknown>;
+}
 
 async function handleApi(request: Request, env: Env, url: URL, path: string): Promise<Response> {
   const role = await requireRole(env, bearerToken(request));
@@ -160,30 +228,32 @@ async function handleApi(request: Request, env: Env, url: URL, path: string): Pr
   if (segments.includes(null)) fail("invalid_input", "malformed percent-encoding in the URL path");
   const [resource, id, ...rest] = segments as string[];
 
+  // Match the route first: 405 is only for a known route called with the wrong method.
+  let route: ApiRoute | null = null;
   if (resource === "call" && id !== undefined && rest.length === 0) {
-    if (request.method !== "POST") return methodNotAllowed("POST");
-    return ok(await callTool(ctx, id, await readJson(request)));
+    route = { method: "POST", run: async () => callTool(ctx, id, await readJson(request)) };
+  } else if (resource === "me" && id === undefined) {
+    route = { method: "GET", run: () => callTool(ctx, "whoami", {}) };
+  } else if (resource === "builds" && id === undefined) {
+    route = { method: "GET", run: () => callTool(ctx, "build_list", { include_closed: flag(query.get("include_closed")) }) };
+  } else if (resource === "builds" && id !== undefined && rest.length === 0) {
+    route = { method: "GET", run: () => callTool(ctx, "ledger_get", { build_id: id }) };
+  } else if (resource === "inbox" && id === undefined) {
+    route = {
+      method: "GET",
+      run: () =>
+        callTool(ctx, "inbox", {
+          build_id: query.get("build_id"),
+          since: integer(query.get("since")),
+          peek: flag(query.get("peek")),
+          limit: integer(query.get("limit")),
+          session_ref: query.get("session_ref"),
+        }),
+    };
   }
-  if (request.method !== "GET") return methodNotAllowed("GET");
-  if (resource === "me" && id === undefined) return ok(await callTool(ctx, "whoami", {}));
-  if (resource === "builds" && id === undefined) {
-    return ok(await callTool(ctx, "build_list", { include_closed: flag(query.get("include_closed")) }));
-  }
-  if (resource === "builds" && id !== undefined && rest.length === 0) {
-    return ok(await callTool(ctx, "ledger_get", { build_id: id }));
-  }
-  if (resource === "inbox" && id === undefined) {
-    return ok(
-      await callTool(ctx, "inbox", {
-        build_id: query.get("build_id"),
-        since: integer(query.get("since")),
-        peek: flag(query.get("peek")),
-        limit: integer(query.get("limit")),
-        session_ref: query.get("session_ref"),
-      }),
-    );
-  }
-  return errorResponse("not_found", `no route for ${path}`);
+  if (!route) return notFound();
+  if (request.method !== route.method) return methodNotAllowed(route.method);
+  return ok(await route.run());
 }
 
 // ---------------------------------------------------------------- spike endpoints
@@ -232,5 +302,5 @@ async function handleSpike(request: Request, env: Env, url: URL, path: string): 
     return methodNotAllowed("GET, POST");
   }
 
-  return errorResponse("not_found", `no route for ${path}`);
+  return notFound();
 }

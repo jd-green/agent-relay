@@ -3,7 +3,9 @@
   "name": "agent-relay",
   "main": "src/index.ts",
   "compatibility_date": "2026-10-01",
-  "observability": { "enabled": true },
+  // Invocation logs would store every request URL, and /mcp/<token> URLs carry role tokens.
+  // console.log / console.error output stays in Workers Logs.
+  "observability": { "enabled": true, "logs": { "enabled": true, "invocation_logs": false } },
   "rules": [{ "type": "Text", "globs": ["**/*.md", "**/*.html"], "fallthrough": true }],
   "vars": {
     "HUMAN_NAME": "James",

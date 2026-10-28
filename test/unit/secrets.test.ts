@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { findSecret } from "../../src/secrets";
-import { PREVIEW, TOKENS, call, callRaw, createBuild, inProgressBuild, send, useCleanState } from "./helpers";
+import { PREVIEW, TOKENS, api, call, callRaw, createBuild, inProgressBuild, send, useCleanState } from "./helpers";
 
 useCleanState();
 
@@ -36,6 +36,65 @@ describe("secret scanner", () => {
     expect(findSecret(`token at op://Vault/${FAKES["Anthropic API key"]}/field`, [])).toBeNull();
     expect(findSecret("Task T2: risk-assessment-for-the-onboarding-flow-and-the-checkout-page", [])).toBeNull();
     expect(findSecret("Ship the AKIA tag and the eyJ prefix later", [])).toBeNull();
+    // Spaces in vault and item names, an optional fourth segment, and punctuation after the reference.
+    expect(findSecret("op://Private/Anthropic API/credential", [])).toBeNull();
+    expect(findSecret(`"op://Dev Vault/Open AI/${FAKES["OpenAI-style API key"]}/section".`, [])).toBeNull();
+    expect(findSecret(`(see op://Private/GitHub/${FAKES["GitHub token"]}), then deploy`, [])).toBeNull();
+  });
+
+  it("checks role tokens on the raw text, op:// references included", () => {
+    const token = TOKENS.human;
+    for (const text of [
+      `op://Vault/${token}/field`,
+      `op://${token}`,
+      `https://x.example/a?op://=${token}`,
+      `op://Private/Item/credential ${token}`,
+    ]) {
+      expect(findSecret(text, [token])?.kind, text).toBe("relay role token");
+    }
+    expect(findSecret({ detail: { note: `op://${TOKENS.orchestrator}` } }, [TOKENS.orchestrator])).toEqual({
+      kind: "relay role token",
+      path: "detail.note",
+    });
+  });
+
+  it("only skips matches wholly inside a strict op:// reference", () => {
+    const anthropic = FAKES["Anthropic API key"];
+    const cases: [string, string][] = [
+      [`op://x/y,${anthropic}`, "Anthropic API key"], // two segments: not a reference
+      [`op://vault/${FAKES["GitHub token"]}`, "GitHub token"],
+      [`op://Private/Item/field ${anthropic}`, "Anthropic API key"], // the last segment can't hold a space
+      [`op://Private/Item/field,${anthropic}`, "Anthropic API key"],
+      [`op://Private/Item/field?k=${anthropic}`, "Anthropic API key"],
+      [`op://Private/Item/field&${FAKES["Slack token"]}`, "Slack token"],
+      [`op://Private/Item/field.\t${anthropic}`, "Anthropic API key"],
+      [`op://Private/Anthropic/credential and later ${FAKES["Google API key"]}`, "Google API key"],
+      [`op:/Private/Item/${anthropic}`, "Anthropic API key"],
+      [`OP://Private/Item/${anthropic}`, "Anthropic API key"],
+      [`op://Private/Item/credential\n${anthropic}`, "Anthropic API key"],
+    ];
+    for (const [text, kind] of cases) expect(findSecret(text, [])?.kind, text).toBe(kind);
+  });
+
+  it("does not take kebab-case identifiers for OpenAI keys", () => {
+    for (const text of [
+      "CSS class sk-loading-skeleton-placeholder-component-v2",
+      "my_sk-abcdefghijklmnopqrstuvwxyz0123456789",
+      "sk-abcdefghijklmnopqrstuvwxyz-abcdefghijklmnop",
+      "sk-proj-loading-skeleton-placeholder-component",
+      "id: sk-ABCDEFGHIJKLMNOPQRSTUVWXYZABCDEFGHIJ", // uppercase but no digit
+      "id: sk-abcdefghijklmnopqrstuvwxyz0123456789", // a digit but no uppercase
+    ]) {
+      expect(findSecret(text, []), text).toBeNull();
+    }
+    for (const text of [
+      join("sk-", "Ab3".repeat(12)),
+      join("key=sk-", "proj-", "abcdefghij0123456789abcdefghij01"),
+      join("sk-", "svcacct-", "A".repeat(32)),
+      join("sk-", "admin-", "x1".repeat(16)),
+    ]) {
+      expect(findSecret(text, [])?.kind, text).toBe("OpenAI-style API key");
+    }
   });
 
   it("names the path of the first hit", () => {
@@ -55,6 +114,9 @@ describe("secret_detected", () => {
       { ...base, body: `key: ${FAKES["Anthropic API key"]}` },
       { ...base, links: [{ url: "https://example.com", label: FAKES["GitHub token"] }] },
       { ...base, body: `Use ${TOKENS.human}` },
+      { ...base, links: [{ url: `https://x.example/a?op://=${TOKENS.human}` }] },
+      { ...base, body: `op://Private/Relay/${TOKENS.human}/token` },
+      { ...base, body: `op://x/y,${FAKES["Anthropic API key"]}` },
     ];
     for (const input of cases) {
       const { status, body } = await callRaw("developer", "send", input);
@@ -95,5 +157,14 @@ describe("secret_detected", () => {
 
     const create = await callRaw("human", "build_create", { title: "x", brief: `deploy with ${FAKES["Anthropic API key"]}` });
     expect(create.body.error.code).toBe("secret_detected");
+  });
+
+  it("rejects a role token inside an op:// reference in spike event details", async () => {
+    const { status, body } = await api("developer", "POST", "/spike/events", { event: "probe", detail: { note: `op://${TOKENS.orchestrator}` } });
+    expect(status).toBe(400);
+    expect(body.error.code).toBe("secret_detected");
+    expect(JSON.stringify(body)).not.toContain(TOKENS.orchestrator);
+    const fine = await api("developer", "POST", "/spike/events", { event: "probe", detail: { note: "op://Private/Relay/developer token" } });
+    expect(fine.status).toBe(200);
   });
 });

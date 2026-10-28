@@ -61,21 +61,26 @@ describe("inbox across builds", () => {
     const first = await createBuild({ title: "First", brief: "Brief one" });
     const second = await createBuild({ title: "Second", brief: "Brief two" });
     const third = await createBuild({ title: "Third", brief: "Brief three" });
+    // A closed build stays in the build-less inbox only while the caller has unread mail there.
+    await call("orchestrator", "inbox", { build_id: third.build_id });
     await call("human", "build_control", { build_id: third.build_id, action: "cancel" });
     await send("human", { build_id: second.build_id, to_role: "orchestrator", type: "status", body: "Second follow-up" });
 
     const inbox = await call("orchestrator", "inbox", { since: 5, session_ref: "orchestrator-main" });
-    expect(inbox.builds.map((entry: Json) => entry.build_id)).toEqual([first.build_id, second.build_id]);
+    expect(inbox.builds.map((entry: Json) => entry.build_id)).toEqual([first.build_id, second.build_id, third.build_id]);
     expect(inbox.builds.map((entry: Json) => entry.messages.map((m: Json) => m.body))).toEqual([
       ["Brief one"],
       ["Brief two", "Second follow-up"],
+      ["Build cancelled by Ada. Stop work on it."],
     ]);
     expect(inbox.builds.map((entry: Json) => entry.thread_key)).toEqual([
       `${first.build_id}/orchestrator`,
       `${second.build_id}/orchestrator`,
+      `${third.build_id}/orchestrator`,
     ]);
 
     const again = await call("orchestrator", "inbox", {});
+    expect(again.builds.map((entry: Json) => entry.build_id)).toEqual([first.build_id, second.build_id]);
     expect(again.builds.flatMap((entry: Json) => entry.messages)).toEqual([]);
     const ledger = await call("human", "ledger_get", { build_id: second.build_id });
     expect(ledger.threads.find((t: Json) => t.role === "orchestrator").session_ref).toBe("orchestrator-main");

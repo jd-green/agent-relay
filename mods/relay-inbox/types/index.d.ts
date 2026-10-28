@@ -24,11 +24,11 @@ export type RelayHealth =
   | { kind: 'unauthorized' }
   | { kind: 'failing'; message: string; retryAt: number }
 
-/** What the band and the status line draw from. */
+/** What the band and the status line draw from: the last peek, less what was handed over since. */
 export type RelayInbox = {
   /** The role the token belongs to, once the relay has answered. */
   role: string | null
-  /** Unread messages the model has not been given yet, oldest first. */
+  /** Messages unread on the relay as of the last peek, oldest first. */
   unread: RelayMessage[]
   builds: RelayBuild[]
   /** The global kill switch's reason while it is on. */
@@ -36,20 +36,14 @@ export type RelayInbox = {
   health: RelayHealth
 }
 
-/** Bookkeeping that must survive a reload so nothing is injected or woken for twice. */
+/** Bookkeeping that must survive a reload so no batch wakes the session twice. */
 export type RelayMemory = {
-  /** `<build_id>/<id>` of every message already put in the model's context (newest 500). */
-  delivered: string[]
   /** `<build_id>/<id>` of every message that already triggered a wake (newest 500). */
   woken: string[]
-  /** Messages the relay marked read for us that the model has not been given yet. */
-  carried: RelayMessage[]
-  /** The newest messages given to the model, oldest first; /relay shows them and /relay-reply answers the last. */
+  /** The newest messages handed to the model, oldest first; /relay shows them and /relay-reply answers the last. */
   recent: RelayMessage[]
   /** Engine-clock time of the last wake, 0 for never. */
   lastWakeAt: number
-  /** Delivered messages still to be marked read on the relay. */
-  markReadPending: boolean
 }
 
 declare module 'claude-code' {

@@ -1,6 +1,7 @@
 import { z } from "zod";
 import type { Config } from "./config";
 import { fail, unwrap } from "./errors";
+import { CLOSED_BUILD_STATUSES } from "./model";
 import { ROLES, displayName, enabledTokens, isAgent, resolveRole, roleDirectory, type Role } from "./roles";
 import { describeIssues, schemas, type ToolInput, type ToolName } from "./schemas";
 import { assertNoSecrets } from "./secrets";
@@ -78,7 +79,8 @@ export const TOOLS: readonly Tool[] = [
     description:
       "Start a build (one small app or feature carried to done by the roles). When the human creates it, the brief goes to " +
       "the orchestrator as a kickoff task message. Only a limited number of builds may be active at once. " +
-      "gates.plan_approval and gates.final_signoff (default true) decide whether those steps wait for the human.",
+      "gates.plan_approval and gates.final_signoff (default true) decide whether those steps wait for the human; only the " +
+      "human may turn them off or raise caps above the defaults (the orchestrator may only lower caps).",
     roles: ORCHESTRATOR_OR_HUMAN,
     annotations: WRITE,
     agentWrite: true,
@@ -103,9 +105,11 @@ export const TOOLS: readonly Tool[] = [
     description:
       "Send a typed message to another role in a build; your sender identity comes from your token. Work types update " +
       "the ledger: task (orchestrator or the human assigns task_id to to_role), handoff (the task's owner passes it and its " +
-      "links to to_role), review_request (the owner asks to_role to review; needs at least one preview link), verdict " +
-      "(the reviewer answers approved, or changes_requested with a numbered changes list). Agents may send work types " +
-      "only while the build is in_progress. question and status have no ledger effect.",
+      "links to to_role; with next_task_id, task_id is your finished task, which this closes, and to_role continues on " +
+      "next_task_id), review_request (the owner asks the task's reviewer to review; needs at least one preview link; " +
+      "refused while the task is already in review or out of rounds), verdict (the reviewer answers the task's assignee: " +
+      "approved, or changes_requested with a numbered changes list). Agents may send work types only while the build is " +
+      "in_progress, and none on a task escalated to the human. question and status have no ledger effect.",
     roles: ROLES,
     annotations: WRITE,
     agentWrite: true,
@@ -117,8 +121,9 @@ export const TOOLS: readonly Tool[] = [
     title: "Read my inbox",
     description:
       "Call at the start of every turn. Returns messages addressed to you (unread ones, or every one after `since`), " +
-      "marks them read unless peek is true, and lists your open tasks and the pending gates of each build. Omit " +
-      "build_id to read every active build. If halted.global is true the kill switch is on: stop working.",
+      "marks them read unless peek is true, and lists your open tasks (with ready / waiting_on) and the pending gates " +
+      "of each build. Omit build_id to read every active build, plus any shipped or cancelled build where you still " +
+      "have unread messages. If halted.global is true the kill switch is on: stop working.",
     roles: ROLES,
     annotations: { ...WRITE, idempotentHint: false },
     agentWrite: false,
@@ -133,9 +138,16 @@ export const TOOLS: readonly Tool[] = [
         return { role: ctx.role, halted, builds: [unwrap(entry)] };
       }
       // Across builds, `since` is ignored: seq numbers are per build.
-      const [halted, ids] = await Promise.all([relay.getKillSwitch(), relay.activeBuildIds()]);
+      const [halted, ids] = await Promise.all([relay.getKillSwitch(), relay.inboxBuildIds(ctx.role)]);
       const entries = await Promise.all(ids.map((id) => buildStub(ctx.env, id).inbox(ctx.role, options)));
-      return { role: ctx.role, halted, builds: entries.flatMap((entry) => (entry.ok ? [entry.result] : [])) };
+      // A closed build is listed only while it still has something for the caller.
+      const builds = entries.flatMap((entry) =>
+        entry.ok &&
+        !(CLOSED_BUILD_STATUSES.includes(entry.result.status) && entry.result.messages.length === 0 && entry.result.unread_remaining === 0)
+          ? [entry.result]
+          : [],
+      );
+      return { role: ctx.role, halted, builds };
     },
   }),
 
@@ -157,9 +169,11 @@ export const TOOLS: readonly Tool[] = [
     description:
       "Without task_id, creates a task (orchestrator or the human; title and assignee required; the assignee becomes the " +
       "owner; build must be planning or in_progress). With task_id: the orchestrator may change any field and any status " +
-      "except in_review/changes_requested (those come from review_request and verdict messages); the task's current " +
-      "owner may set status todo, in_progress or blocked (or done when the task has no reviewer) and add links and a " +
-      "note. links are appended to artifacts and note to notes.",
+      "except in_review/changes_requested (those come from review_request and verdict messages); done needs an approved " +
+      "verdict for the current round once a task has a reviewer or a review. The task's current owner may set status " +
+      "todo, in_progress or blocked (or done when the task has no reviewer) and add links and a note, but a reviewer " +
+      "never changes the status of a task in review (send the verdict). Its assignee may add links and a note at any " +
+      "time. links are appended to artifacts (deduplicated, at most 50) and note to notes (at most 50).",
     roles: ROLES,
     annotations: WRITE,
     agentWrite: true,
@@ -184,8 +198,8 @@ export const TOOLS: readonly Tool[] = [
     title: "Decide a gate",
     description:
       "Approve or reject a pending gate. plan_approval: in_progress, or back to planning. final_signoff: shipped, or " +
-      "back to in_progress. escalation: grant extra_rounds more review rounds, or leave the task blocked with the " +
-      "orchestrator. The orchestrator (and for escalations the assignee) is told.",
+      "back to in_progress. escalation: grant extra_rounds more review rounds, or cancel the task (the orchestrator can " +
+      "plan a narrower one). The orchestrator (and for escalations the assignee) is told.",
     roles: HUMAN_ONLY,
     annotations: WRITE,
     agentWrite: false,
@@ -195,7 +209,9 @@ export const TOOLS: readonly Tool[] = [
   define({
     name: "build_control",
     title: "Control a build",
-    description: "Halt, resume or cancel a build, or change its caps (set_caps with caps).",
+    description:
+      "Halt, resume or cancel a build, or change its caps (set_caps with caps). Resume and cancel tell the orchestrator " +
+      "and the owner of every open task.",
     roles: HUMAN_ONLY,
     annotations: { ...WRITE, destructiveHint: true },
     agentWrite: false,
@@ -207,7 +223,7 @@ export const TOOLS: readonly Tool[] = [
     title: "Global kill switch",
     description:
       "on: true stops every agent write in every build and pauses nudges; inbox keeps answering with " +
-      "halted.global = true. on: false clears it.",
+      "halted.global = true. on: false clears it and tells the orchestrator and every open task's owner to carry on.",
     roles: HUMAN_ONLY,
     annotations: { ...WRITE, destructiveHint: true, idempotentHint: true },
     agentWrite: false,

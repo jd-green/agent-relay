@@ -12,7 +12,8 @@ describe("audit", () => {
     await buildSql(buildId, "UPDATE tasks SET last_activity_ms = last_activity_ms - 3600000");
     await runAlarm(buildId);
 
-    const { audit } = await ledger(buildId);
+    const { audit, messages } = await ledger(buildId);
+    const nudge = messages.find((message: Json) => message.body.startsWith("Nudge:"));
     const rows = audit.map((row: Json) => [row.actor, row.action, row.target]);
     expect(rows).toEqual(
       expect.arrayContaining([
@@ -22,12 +23,13 @@ describe("audit", () => {
         ["orchestrator", "gate.requested", "G1"],
         ["relay", "gate.decided", "G1"],
         ["relay", "build.status", buildId],
-        ["developer", "message.sent", "M2"],
+        ["relay", "message.sent", "M2"], // the plan auto-approval notice
+        ["developer", "message.sent", "M3"],
         ["developer", "task.updated", taskId],
         ["human", "build.halted", buildId],
         ["human", "build.resumed", buildId],
         ["relay", "nudge.sent", taskId],
-        ["relay", "message.sent", "M3"],
+        ["relay", "message.sent", nudge.id],
       ]),
     );
     for (const row of audit) {

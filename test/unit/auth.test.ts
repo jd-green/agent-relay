@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { authenticate } from "../../src/auth";
+import { loadConfig } from "../../src/config";
+import { aliases, displayName, resolveRole } from "../../src/roles";
 import { env } from "cloudflare:workers";
 import { TOKENS, api, call, callRaw, createBuild, fetchWorker, mcp, useCleanState, type Role } from "./helpers";
 
@@ -53,9 +55,23 @@ describe("auth", () => {
   it("rejects an unknown /mcp/<token> path with a JSON-RPC 401", async () => {
     const response = await mcp(null, { jsonrpc: "2.0", id: 1, method: "ping" }, `/mcp/${"y".repeat(40)}`);
     expect(response.status).toBe(401);
-    expect(response.headers.get("www-authenticate")).toContain("Bearer");
     const body = await response.json<{ error: { code: number } }>();
     expect(body.error.code).toBe(-32001);
+  });
+
+  it("challenges a presented but unknown token with error=\"invalid_token\"", async () => {
+    const invalid = 'Bearer realm="agent-relay", error="invalid_token", error_description="unknown or rotated relay token"';
+    const ping = { jsonrpc: "2.0", id: 1, method: "ping" };
+    expect((await mcp("x".repeat(40), ping)).headers.get("www-authenticate")).toBe(invalid);
+    expect((await mcp(null, ping, `/mcp/${"y".repeat(40)}`)).headers.get("www-authenticate")).toBe(invalid);
+    expect((await mcp(null, ping, "/mcp/%E0%A4%A")).headers.get("www-authenticate")).toBe(invalid);
+    // No token at all: the bare challenge (RFC 6750 sends no error code then).
+    for (const response of [await mcp(null, ping), await mcp(null, ping, "/mcp/")]) {
+      expect(response.status).toBe(401);
+      expect(response.headers.get("www-authenticate")).toBe('Bearer realm="agent-relay"');
+    }
+    const basic = await fetchWorker("/mcp", { method: "POST", headers: { authorization: `Basic ${TOKENS.human}` }, body: JSON.stringify(ping) });
+    expect(basic.headers.get("www-authenticate")).toBe('Bearer realm="agent-relay"');
   });
 
   it("does not accept path tokens on the JSON API", async () => {
@@ -119,6 +135,39 @@ describe("sender identity", () => {
       type: "status",
       body: "hello relay",
     });
+    expect(toRelay.body.error.code).toBe("invalid_input");
+  });
+});
+
+describe("HUMAN_NAME collisions", () => {
+  const named = (humanName: string) => ({ ...loadConfig(env), humanName });
+
+  it("never adds a HUMAN_NAME that is a role id, an alias or `relay` as an alias", () => {
+    for (const name of ["Relay", "relay", "Orchestrator", "dev", "CD", "Creative Director", "Full-Stack Developer", "orch", "James"]) {
+      const config = named(name);
+      expect(aliases("human", config), name).toEqual(["james"]);
+      expect(displayName("human", config), name).toBe(name);
+    }
+    expect(aliases("human", named("Ada Lovelace"))).toEqual(["james", "ada-lovelace"]);
+  });
+
+  it("keeps every role name pointing at its own role", () => {
+    expect(resolveRole("relay", named("Relay"))).toBeNull();
+    expect(resolveRole("Relay", named("Relay"))).toBeNull();
+    expect(resolveRole(" RELAY ", named("relay"))).toBeNull();
+    expect(resolveRole("dev", named("Dev"))).toBe("developer");
+    expect(resolveRole("orchestrator", named("Orchestrator"))).toBe("orchestrator");
+    expect(resolveRole("Creative Director", named("Creative Director"))).toBe("creative-director");
+    expect(resolveRole("cd", named("CD"))).toBe("creative-director");
+    // The human is still reachable by id and the fixed alias.
+    expect(resolveRole("human", named("Relay"))).toBe("human");
+    expect(resolveRole("james", named("Dev"))).toBe("human");
+    expect(resolveRole("Ada Lovelace", named("Ada Lovelace"))).toBe("human");
+  });
+
+  it("refuses `relay` as a recipient whatever HUMAN_NAME is", async () => {
+    const build = await createBuild();
+    const toRelay = await callRaw("developer", "send", { build_id: build.build_id, to_role: "Relay", type: "status", body: "hi" });
     expect(toRelay.body.error.code).toBe("invalid_input");
   });
 });

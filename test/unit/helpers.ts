@@ -117,6 +117,35 @@ export function runAlarm(buildId: string): Promise<boolean> {
   return runDurableObjectAlarm(buildStub(buildId));
 }
 
+/**
+ * Lets time pass in a build by moving every clock back: task idle and nudge times, when each role last wrote
+ * (messages and ledger writes) and the idle-build watch. No test-only code paths in the Worker.
+ */
+export function timeTravel(buildId: string, minutes: number) {
+  const shift = minutes * 60_000;
+  return runInDurableObject(buildStub(buildId), (_instance, state) => {
+    const sql = state.storage.sql;
+    sql.exec("UPDATE tasks SET last_activity_ms = last_activity_ms - ?, last_nudge_ms = last_nudge_ms - ?", shift, shift);
+    sql.exec("UPDATE messages SET created_ms = created_ms - ?", shift);
+    sql.exec("UPDATE writes SET at_ms = at_ms - ?", shift);
+    sql.exec(
+      "UPDATE local_state SET idle_since_ms = idle_since_ms - ?, idle_last_nudge_ms = idle_last_nudge_ms - ?",
+      shift,
+      shift,
+    );
+  });
+}
+
+/** Relay messages to `role` in the ledger's message tail, oldest first. */
+export async function relayTo(buildId: string, role: Role): Promise<Json[]> {
+  return (await ledger(buildId)).messages.filter((message: Json) => message.from === "relay" && message.to === role);
+}
+
+/** Reads (and marks read) `role`'s unread messages in one build. */
+export async function readInbox(role: Role, buildId: string): Promise<Json[]> {
+  return (await call(role, "inbox", { build_id: buildId, limit: 100 })).builds[0].messages;
+}
+
 export const PREVIEW = [{ url: "https://preview.example.com/build/1", label: "Preview" }];
 
 /** Creates a build as the human (gates on unless overridden) and returns it. */

@@ -127,10 +127,11 @@ describe("ledger page against a real relay", { skip: MISSING_PLAYWRIGHT, timeout
         const b = await call("human", "build_create", { title, brief: extra.brief ?? `Brief for ${title}.`, ...extra });
         return b.build_id;
       },
-      async task(buildId, { title, assignee = "developer", reviewer = "creative-director", description } = {}) {
+      async task(buildId, { title, assignee = "developer", reviewer = "creative-director", description, dependsOn } = {}) {
         const input = { build_id: buildId, title, assignee };
         if (reviewer) input.reviewer = reviewer;
         if (description) input.description = description;
+        if (dependsOn) input.depends_on = dependsOn;
         return (await call("orchestrator", "ledger_update", input)).task.id;
       },
       async requestPlan(buildId, summary = "Plan: one screen, one task.") {
@@ -228,6 +229,12 @@ describe("ledger page against a real relay", { skip: MISSING_PLAYWRIGHT, timeout
       close: () => context.close(),
     };
   }
+
+  /** Saves a screenshot into SHOTS_DIR (for looking at, not compared). */
+  const shot = async (page, name, options = {}) => {
+    mkdirSync(SHOTS_DIR, { recursive: true });
+    await page.screenshot({ path: join(SHOTS_DIR, `${name}.png`), ...options });
+  };
 
   const waitPost = (page, path) =>
     page.waitForResponse((r) => new URL(r.url()).pathname === path && r.request().method() === "POST");
@@ -447,16 +454,29 @@ describe("ledger page against a real relay", { skip: MISSING_PLAYWRIGHT, timeout
 
       // A well-formed id that does not exist.
       await page.evaluate(() => { location.hash = "#b-aaaaaaaaaa"; });
-      await page.waitForFunction(() => document.getElementById("build").textContent.includes("No build with ID"));
+      await page.waitForSelector(".not-found");
+      assert.equal(await text(page, ".not-found-title"), "No such build");
       assert.match(await text(page, "#build"), /No build with ID b-aaaaaaaaaa\./);
       assert.equal(await page.isHidden("#load-error"), true);
 
-      // A mistyped link (the relay answers 400 invalid_input, not 404) must not leave the page on "Loading build…".
-      await page.evaluate(() => { location.hash = "#not-a-build"; });
-      await page.waitForTimeout(1500);
-      const stuck = await page.evaluate(() => document.getElementById("build").textContent);
-      assert.notEqual(stuck, "Loading build…", "malformed deep link #not-a-build stays on 'Loading build…' forever");
-      s.check({ allow: [400, 404] });
+      // A mistyped or truncated link: the same clear state (never "Loading build…"), without asking the relay.
+      const asked = [];
+      page.on("request", (r) => { if (new URL(r.url()).pathname.startsWith("/api/builds/")) asked.push(r.url()); });
+      for (const bad of ["not-a-build", `${id.slice(0, -2)}`, `${id}x`]) {
+        await page.evaluate((h) => { location.hash = `#${h}`; }, bad);
+        await page.waitForFunction((h) => document.querySelector(".not-found .mono")?.textContent === h, bad, { timeout: 3000 })
+          .catch(() => assert.fail(`malformed deep link #${bad} does not show the "No such build" state`));
+        assert.equal(await text(page, ".not-found-title"), "No such build");
+        assert.match(await text(page, ".not-found"), new RegExp(`No build with ID ${bad}\\.[\\s\\S]*Build links end in an ID like b-`));
+        assert.equal(await page.isHidden("#load-error"), true, `no error banner for #${bad}`);
+      }
+      assert.deepEqual(asked, [], "a malformed id is not sent to the relay");
+      await shot(page, "not-found-light");
+      // The state links back to the list.
+      await page.click(".not-found a:has-text('Back to all builds')");
+      await page.waitForSelector(`.build-card[href="#${id}"]`);
+      assert.equal(new URL(page.url()).hash, "");
+      s.check({ allow: [404] });
     } finally {
       await s.close();
     }
@@ -493,12 +513,16 @@ describe("ledger page against a real relay", { skip: MISSING_PLAYWRIGHT, timeout
     }
   });
 
-  pageTest("escalation gate: choose extra rounds, approve → task max_rounds grew", async () => {
+  pageTest("escalation gate: shows the outstanding changes; choose extra rounds, approve → task max_rounds grew", async () => {
     const sd = seed();
-    const { id, taskId, escalationId } = await sd.escalated("Escalation build");
-    const before = (await sd.ledger(id)).tasks.find((t) => t.id === taskId);
-    assert.equal(before.status, "blocked");
-    assert.equal(before.max_rounds, 3);
+    const changesFor = (n) => [`Round ${n}: the hero image is cropped on narrow screens.`, `Round ${n}: raise the CTA contrast to 4.5:1.`];
+    const { id, taskId, escalationId } = await sd.escalated("Escalation build", { round: (n) => ({ changes: changesFor(n) }) });
+    const before = await sd.ledger(id);
+    const task0 = before.tasks.find((t) => t.id === taskId);
+    assert.equal(task0.status, "blocked");
+    assert.equal(task0.max_rounds, 3);
+    const latest = before.verdicts.filter((v) => v.task_id === taskId).at(-1);
+    assert.deepEqual([latest.verdict, latest.round, latest.changes], ["changes_requested", 3, changesFor(3)]);
 
     const s = await openPage({ hash: `#${id}` });
     const { page } = s;
@@ -506,6 +530,10 @@ describe("ledger page against a real relay", { skip: MISSING_PLAYWRIGHT, timeout
       await page.waitForSelector(".gate select");
       assert.equal(await text(page, ".gate-kind"), "Escalation");
       assert.match(await text(page, ".gate-task"), /T1.*round 3 of 3/);
+      // James decides on the reviewer's latest change list, in the gate card itself.
+      assert.equal(await text(page, ".gate .gate-changes-head"), "Still to fix (round 3, from Creative Director)");
+      assert.deepEqual(await page.locator(".gate .gate-changes .changes li").allInnerTexts(), changesFor(3));
+      assert.match(await text(page, ".gate-hint"), /reject to cancel the task/);
       assert.ok(await page.isVisible(".task .badge:text('Escalated')"));
       assert.equal(await page.inputValue(".gate select"), "1");
       await page.selectOption(".gate select", "3");
@@ -893,7 +921,7 @@ describe("ledger page against a real relay", { skip: MISSING_PLAYWRIGHT, timeout
     }
   });
 
-  pageTest("#spike lists posted events and queues a wake that GET /spike/wake returns", async () => {
+  pageTest("#spike lists posted events and queues a role-targeted wake that GET /spike/wake returns", async () => {
     const session = `sess-e2e-${Date.now()}`;
     const events = [
       { event: "SessionStart", session_id: session, surface: "cli", agent_id: "developer", detail: { cwd: "/work/app" } },
@@ -926,28 +954,54 @@ describe("ledger page against a real relay", { skip: MISSING_PLAYWRIGHT, timeout
       await assertNothingInjected(page);
       assert.equal(await page.locator(`#session-ids option[value="${session}"]`).count(), 1, "session ids are offered");
 
-      // Empty text is refused locally.
+      // The wake form names every role, and a role must be chosen: a wake reaches only that role's pollers.
+      const roles = await page.locator("#wake-role option").evaluateAll((os) => os.map((o) => [o.value, o.textContent]));
+      assert.deepEqual(roles, [["", "Choose a role"], ["orchestrator", "Orchestrator"], ["creative-director", "Creative Director"], ["developer", "Full-Stack Developer"], ["human", "James"]]);
+      let posts = 0;
+      page.on("request", (r) => { if (new URL(r.url()).pathname === "/spike/wake" && r.method() === "POST") posts++; });
+      await page.fill("#wake-text", "No role yet.");
+      await page.click("#wake-send");
+      assert.match(await text(page, "#wake-error"), /Choose the role whose session should get the wake/);
+      assert.equal(await page.evaluate(() => document.activeElement?.id), "wake-role");
+      // Empty text is refused locally too.
+      await page.selectOption("#wake-role", "developer");
+      await page.fill("#wake-text", "");
       await page.click("#wake-send");
       assert.match(await text(page, "#wake-error"), /Enter the text to send/);
+      assert.equal(posts, 0, "nothing is sent until the form is complete");
 
-      // Targeted wake.
+      // Session suggestions follow the role: sessions seen from that role's token.
+      const offered = () => page.locator("#session-ids option").evaluateAll((os) => os.map((o) => o.value));
+      assert.ok((await offered()).includes(session) && !(await offered()).includes("sess-other"), `developer sessions: ${await offered()}`);
+      await page.selectOption("#wake-role", "orchestrator");
+      assert.ok((await offered()).includes("sess-other") && !(await offered()).includes(session), `orchestrator sessions: ${await offered()}`);
+      await page.selectOption("#wake-role", "developer");
+
+      // Targeted wake: role and session.
       await page.fill("#wake-session", session);
       await page.fill("#wake-text", "E2E: check your relay inbox.");
       const [res] = await Promise.all([waitPost(page, "/spike/wake"), page.click("#wake-send")]);
+      assert.deepEqual(res.request().postDataJSON(), { role: "developer", session_id: session, text: "E2E: check your relay inbox." });
       const wake = (await res.json()).result.wake;
-      await page.waitForSelector(`.toast:has-text("Wake ${wake.id} queued for ${session}")`);
+      assert.equal(wake.role, "developer");
+      await page.waitForSelector(`.toast:has-text("Wake ${wake.id} queued for Full-Stack Developer: session ${session}")`);
       assert.equal(await page.inputValue("#wake-text"), "");
+      assert.equal(await text(page, "#wake-error"), "");
       assert.equal((await getJson(relay, "developer", "/spike/wake?session_id=some-other-session")).result.wakes.length, 0);
+      assert.equal((await getJson(relay, "creative-director", `/spike/wake?session_id=${encodeURIComponent(session)}`)).result.wakes.length, 0, "another role's poller never gets it");
       const got = await getJson(relay, "developer", `/spike/wake?session_id=${encodeURIComponent(session)}`);
       assert.equal(got.ok, true);
-      assert.deepEqual(got.result.wakes.map((w) => [w.id, w.session_id, w.text]), [[wake.id, session, "E2E: check your relay inbox."]]);
+      assert.deepEqual(got.result.wakes.map((w) => [w.id, w.role, w.session_id, w.text]), [[wake.id, "developer", session, "E2E: check your relay inbox."]]);
       assert.equal((await getJson(relay, "developer", `/spike/wake?session_id=${encodeURIComponent(session)}`)).result.wakes.length, 0, "wakes are consumed once");
 
-      // Untargeted wake goes to any session.
+      // Untargeted wake: the next session of that role to poll, whatever its session id.
+      await page.selectOption("#wake-role", "creative-director");
       await page.fill("#wake-session", "");
       await page.fill("#wake-text", "Anyone: check your inbox.");
-      await Promise.all([waitPost(page, "/spike/wake"), page.click("#wake-send")]);
-      await page.waitForSelector(`.toast:has-text("queued for any session")`);
+      const [res2] = await Promise.all([waitPost(page, "/spike/wake"), page.click("#wake-send")]);
+      assert.deepEqual(res2.request().postDataJSON(), { role: "creative-director", text: "Anyone: check your inbox." });
+      await page.waitForSelector(`.toast:has-text("queued for Creative Director: the next session to poll")`);
+      assert.equal((await getJson(relay, "developer", "/spike/wake?session_id=whatever")).result.wakes.length, 0, "a developer session never gets the creative director's wake");
       const any = await getJson(relay, "creative-director", "/spike/wake?session_id=whatever");
       assert.deepEqual(any.result.wakes.map((w) => w.text), ["Anyone: check your inbox."]);
       s.check();
@@ -982,6 +1036,188 @@ describe("ledger page against a real relay", { skip: MISSING_PLAYWRIGHT, timeout
     }
   });
 
+  /** Makes the page believe it was hidden or shown (Chromium in a test never really hides it). */
+  const setVisibility = (page, state) =>
+    page.evaluate((v) => {
+      Object.defineProperty(document, "visibilityState", { configurable: true, get: () => v });
+      Object.defineProperty(document, "hidden", { configurable: true, get: () => v === "hidden" });
+      document.dispatchEvent(new Event("visibilitychange"));
+    }, state);
+
+  pageTest("polling pauses while hidden and resumes on hidden → visible", async () => {
+    const sd = seed();
+    const { id } = await sd.inProgress("Visibility build");
+    const s = await openPage({ hash: `#${id}` });
+    const { page } = s;
+    const polls = [];
+    page.on("request", (r) => { if (new URL(r.url()).pathname === `/api/builds/${id}`) polls.push(Date.now()); });
+    const say = (body) => sd.call("developer", "send", { build_id: id, to_role: "orchestrator", type: "status", body });
+    try {
+      await page.waitForSelector(".msg");
+      await page.waitForTimeout(300); // let the first load settle
+      await setVisibility(page, "hidden");
+      const hiddenAt = polls.length;
+      await say("Visibility probe one");
+      // Longer than the refresh interval: the timer comes due while hidden and must not poll.
+      await page.waitForTimeout(11_500);
+      assert.equal(polls.length, hiddenAt, "no polling while the page is hidden");
+      assert.equal(await page.locator(".msg-body:has-text('Visibility probe one')").count(), 0);
+
+      // Shown again after more than one interval: it refreshes at once.
+      const shownAt = Date.now();
+      await setVisibility(page, "visible");
+      await page.waitForSelector(".msg-body:has-text('Visibility probe one')", { timeout: 3000 });
+      console.log(`# visible → refreshed in ${Date.now() - shownAt} ms`);
+
+      // And keeps polling while visible.
+      await say("Visibility probe two");
+      await page.waitForSelector(".msg-body:has-text('Visibility probe two')", { timeout: REFRESH_BUDGET_MS });
+
+      // A quick hide/show before the next poll is due re-arms the timer: polling never stays stopped.
+      await setVisibility(page, "hidden");
+      await page.waitForTimeout(1000);
+      await setVisibility(page, "visible");
+      await say("Visibility probe three");
+      await page.waitForSelector(".msg-body:has-text('Visibility probe three')", { timeout: REFRESH_BUDGET_MS });
+      s.check();
+    } finally {
+      await s.close();
+    }
+  });
+
+  pageTest("a relay read that never answers times out and polling carries on", async () => {
+    const sd = seed();
+    const { id } = await sd.inProgress("Hung request build");
+    const s = await openPage({ hash: `#${id}` });
+    const { page } = s;
+    try {
+      await page.waitForSelector(".msg");
+      let hang = true;
+      let hung = 0;
+      await page.route(new RegExp(`/api/builds/${id}$`), (route) => {
+        if (hang) { hang = false; hung++; return; } // never answered
+        return route.continue();
+      });
+      await page.click("#refresh");
+      await page.waitForSelector("#updated.is-stale", { timeout: 20_000 });
+      assert.equal(hung, 1);
+      assert.equal(await text(page, "#updated"), "Update failed");
+      assert.match(await text(page, "#load-error"), /No answer: The relay did not answer in time[\s\S]*Showing the last data loaded/);
+      await sd.call("developer", "send", { build_id: id, to_role: "orchestrator", type: "status", body: "After the hang" });
+      await page.waitForSelector(".msg-body:has-text('After the hang')", { timeout: REFRESH_BUDGET_MS });
+      await page.waitForSelector("#updated:not(.is-stale)");
+      assert.equal(await page.isHidden("#load-error"), true);
+      const unexpected = s.problems.filter((p) => !(p.kind === "console" && /ERR_ABORTED|aborted/i.test(p.text)));
+      assert.deepEqual(unexpected, []);
+    } finally {
+      await s.close();
+    }
+  });
+
+  pageTest("read state: 'unread by <recipient>', cleared when the recipient reads it; none on the viewer's own mail", async () => {
+    const sd = seed();
+    const { id } = await sd.inProgress("Read state build");
+    const toDev = (await sd.call("orchestrator", "send", { build_id: id, to_role: "developer", type: "status", body: "Read probe: for the developer" })).message.id;
+    const toCd = (await sd.call("orchestrator", "send", { build_id: id, to_role: "creative-director", type: "status", body: "Read probe: for the creative director" })).message.id;
+    const toMe = (await sd.call("orchestrator", "send", { build_id: id, to_role: "human", type: "question", body: "Read probe: for James" })).message.id;
+    const s = await openPage({ hash: `#${id}` });
+    const { page } = s;
+    const foot = (msgId) => page.locator(".msg", { has: page.locator(`.msg-foot .mono:text-is("${msgId}")`) }).locator(".msg-foot");
+    try {
+      await page.waitForSelector(".msg-body:has-text('Read probe: for James')");
+      assert.match(await foot(toDev).innerText(), /unread by Full-Stack Developer/);
+      assert.match(await foot(toCd).innerText(), /unread by Creative Director/);
+      assert.doesNotMatch(await foot(toMe).innerText(), /unread/, "no read state on James's own mail (the page never marks it read)");
+      assert.equal(await page.locator(".msg-foot span:text-is('unread')").count(), 0, "never a bare 'unread'");
+
+      // The developer reads its inbox: its message is no longer unread; the creative director's still is.
+      await sd.call("developer", "inbox", { build_id: id });
+      const ledger = await sd.ledger(id);
+      assert.ok(ledger.messages.find((m) => m.id === toDev).read_at, "the relay marked it read");
+      await page.click("#refresh");
+      await page.waitForFunction((msgId) => {
+        const card = [...document.querySelectorAll(".msg")].find((m) => m.querySelector(".msg-foot .mono")?.textContent === msgId);
+        return card && !card.querySelector(".msg-unread");
+      }, toDev);
+      assert.match(await foot(toCd).innerText(), /unread by Creative Director/);
+      s.check();
+    } finally {
+      await s.close();
+    }
+
+    // Seen with the developer's token, its own (unread) mail carries no read state; other recipients' still do.
+    const toDev2 = (await sd.call("orchestrator", "send", { build_id: id, to_role: "developer", type: "status", body: "Read probe: second for the developer" })).message.id;
+    const dev = await openPage({ role: "developer", hash: `#${id}` });
+    try {
+      await dev.page.waitForSelector(".msg-body:has-text('Read probe: second for the developer')");
+      const devFoot = (msgId) => dev.page.locator(".msg", { has: dev.page.locator(`.msg-foot .mono:text-is("${msgId}")`) }).locator(".msg-foot");
+      assert.equal((await sd.ledger(id)).messages.find((m) => m.id === toDev2).read_at, null);
+      assert.doesNotMatch(await devFoot(toDev2).innerText(), /unread/);
+      assert.match(await devFoot(toMe).innerText(), /unread by James/);
+      dev.check();
+    } finally {
+      await dev.close();
+    }
+  });
+
+  pageTest("a task waiting on another shows 'Waiting on T1' until it closes (also from an older relay)", async () => {
+    const sd = seed();
+    const id = await sd.build("Waiting build");
+    const t1 = await sd.task(id, { title: "Design spec", assignee: "creative-director", reviewer: null });
+    const t2 = await sd.task(id, { title: "Build from the spec", dependsOn: [t1] });
+    const t3 = await sd.task(id, { title: "Deploy", dependsOn: [t1, t2], reviewer: null });
+    await sd.call("human", "gate_decide", { build_id: id, gate_id: await sd.requestPlan(id), decision: "approved" });
+    const relayTasks = (await sd.ledger(id)).tasks;
+    assert.deepEqual(relayTasks.map((t) => [t.id, t.ready, t.waiting_on]), [[t1, true, []], [t2, false, [t1]], [t3, false, [t1, t2]]], "the relay reports ready / waiting_on");
+
+    const s = await openPage({ hash: `#${id}` });
+    const { page } = s;
+    const badges = (taskId) => page.locator(".task", { has: page.locator(`.task-id:text-is("${taskId}")`) }).locator(".badge").allTextContents();
+    try {
+      await page.waitForSelector(".task");
+      assert.deepEqual(await badges(t1), []);
+      assert.deepEqual(await badges(t2), [`Waiting on ${t1}`]);
+      assert.deepEqual(await badges(t3), [`Waiting on ${t1}, ${t2}`]);
+
+      // An older relay without ready / waiting_on: the page works it out from depends_on.
+      await page.route(new RegExp(`/api/builds/${id}$`), async (route) => {
+        const response = await route.fetch();
+        const json = await response.json();
+        for (const t of json.result.tasks) { delete t.ready; delete t.waiting_on; }
+        await route.fulfill({ response, json });
+      });
+      await page.reload();
+      await page.waitForSelector(".task");
+      assert.deepEqual(await badges(t2), [`Waiting on ${t1}`]);
+      assert.deepEqual(await badges(t3), [`Waiting on ${t1}, ${t2}`]);
+      await page.unroute(new RegExp(`/api/builds/${id}$`));
+
+      // T1 closes: T2 is ready; T3 still waits on T2.
+      await sd.call("orchestrator", "ledger_update", { build_id: id, task_id: t1, status: "done" });
+      await page.click("#refresh");
+      await page.waitForFunction((tid) => {
+        const card = [...document.querySelectorAll(".task")].find((c) => c.querySelector(".task-id")?.textContent === tid);
+        return card && ![...card.querySelectorAll(".badge")].some((b) => b.textContent.startsWith("Waiting on"));
+      }, t2);
+      assert.deepEqual(await badges(t3), [`Waiting on ${t2}`]);
+      s.check();
+    } finally {
+      await s.close();
+    }
+
+    // The developer owns T2: it reads "Waiting on T1"-free now and "Waiting on you"; T3 waits on T2, not on the developer.
+    const dev = await openPage({ role: "developer", hash: `#${id}` });
+    try {
+      await dev.page.waitForSelector(".task");
+      const devBadges = (taskId) => dev.page.locator(".task", { has: dev.page.locator(`.task-id:text-is("${taskId}")`) }).locator(".badge").allTextContents();
+      assert.deepEqual(await devBadges(t2), ["Waiting on you"]);
+      assert.deepEqual(await devBadges(t3), [`Waiting on ${t2}`]);
+      dev.check();
+    } finally {
+      await dev.close();
+    }
+  });
+
   pageTest("cancel a build from the detail page", async () => {
     const sd = seed();
     const { id, gateId } = await sd.planned("Cancel build");
@@ -1006,7 +1242,7 @@ describe("ledger page against a real relay", { skip: MISSING_PLAYWRIGHT, timeout
     }
   });
 
-  pageTest("message-cap halt: the page lets James raise the cap so Resume can work", async () => {
+  pageTest("message-cap halt: 'Raise cap and resume' (phone), and Edit caps in About this build", async () => {
     const r = await launchRelay({ vars: { ...RELAY_VARS, MAX_MESSAGES_PER_BUILD: "3" } });
     try {
       const sd = seeder(r);
@@ -1017,27 +1253,82 @@ describe("ledger page against a real relay", { skip: MISSING_PLAYWRIGHT, timeout
         if (!res.ok) capped = res;
       }
       assert.equal(capped?.error.code, "cap_reached");
-      assert.equal((await sd.ledger(id)).build.halt_reason, "message cap reached");
+      const halted = (await sd.ledger(id)).build;
+      assert.equal(halted.halt_reason, "message cap reached");
+      const used = halted.message_count;
+      assert.equal(halted.caps.max_messages, 3);
 
-      const s = await openPage({ hash: `#${id}`, target: r });
+      const s = await openPage({ hash: `#${id}`, target: r, viewport: PHONE });
       const { page } = s;
+      const controls = [];
+      page.on("request", (q) => { if (new URL(q.url()).pathname === "/api/call/build_control") controls.push(q.postDataJSON()); });
       try {
-        await page.waitForSelector(".callout");
+        await page.waitForSelector(".callout .cap-form");
         assert.match(await text(page, ".callout"), /message cap reached/);
-        // Resume alone cannot help: the count is still at the cap, so the next agent message halts it again.
-        await page.click("button:has-text('Resume')");
+        assert.equal(await text(page, ".cap-form label"), `New message cap (${used} of 3 agent messages used)`);
+        assert.equal(await page.inputValue(".cap-form input"), "103", "suggests the cap plus 100");
+        await assertNoHorizontalScroll(page, "cap-halted build");
+        await shot(page, "cap-halted-light");
+        await assertTapTargets(page, [".cap-form input", ".cap-form button", ".controls .btn", ".info button"], "cap-halted build");
+
+        // Resume alone cannot help while the count is at the cap: the relay refuses it and says why.
+        await page.click(".controls button:has-text('Resume')");
         await Promise.all([waitPost(page, "/api/call/build_control"), page.click("#confirm-ok")]);
+        await page.waitForFunction(() => /message cap/.test(document.querySelector("#confirm-error")?.textContent ?? ""));
+        await page.click("#confirm-cancel");
+        assert.equal((await sd.ledger(id)).build.status, "halted", "a refused resume leaves the build halted");
+        await page.waitForSelector(".callout .cap-form");
+        const usedNow = (await sd.ledger(id)).build.message_count;
+
+        // A cap that is not above what was already sent is refused on the page.
+        controls.length = 0;
+        await page.fill(".cap-form input", String(usedNow));
+        await page.click(".cap-form button:has-text('Raise cap and resume')");
+        await page.waitForFunction(() => document.querySelector(".cap-form .form-error")?.textContent.length > 0);
+        assert.match(await text(page, ".cap-form .form-error"), new RegExp(`Enter a whole number from ${usedNow + 1} to 10000`));
+        assert.deepEqual(controls, [], "nothing sent for a cap that cannot help");
+
+        // Raise to 10 and resume: set_caps, then resume, in that order.
+        await page.fill(".cap-form input", "10");
+        await page.click(".cap-form button:has-text('Raise cap and resume')");
+        await page.waitForSelector(".toast:has-text('Message cap raised to 10')");
         await page.waitForFunction(() => document.querySelector(".detail-meta .pill")?.textContent === "In progress");
-        const again = await r.call("developer", "send", { build_id: id, to_role: "orchestrator", type: "status", body: "after resume" });
-        assert.equal(again.error?.code, "cap_reached", "resume without raising the cap re-trips it at once");
-        await page.click("#refresh");
-        await page.waitForSelector(".callout");
-        // build_control set_caps exists for this; the page must offer it on a cap-halted build.
-        const capControls = await page.locator("#build button, #build input, #build select")
-          .filter({ hasText: /cap|limit/i }).count()
-          + await page.locator("#build input[type=number], #build [data-key^='caps']").count();
-        assert.ok(capControls > 0, "no control on the page to raise the message cap (build_control set_caps); a cap-halted build cannot be continued from the phone");
-        s.check();
+        assert.deepEqual(controls, [
+          { build_id: id, action: "set_caps", caps: { max_messages: 10 } },
+          { build_id: id, action: "resume" },
+        ]);
+        await page.waitForFunction((n) => document.querySelector(".info")?.textContent.includes(`${n} of 10`), usedNow);
+        let build = (await sd.ledger(id)).build;
+        assert.equal(build.status, "in_progress");
+        assert.equal(build.caps.max_messages, 10);
+        assert.equal((await r.call("developer", "send", { build_id: id, to_role: "orchestrator", type: "status", body: "carrying on" })).ok, true, "the build really continues");
+
+        // Edit caps: only the changed cap is sent.
+        controls.length = 0;
+        await page.click(".info button:has-text('Edit caps')");
+        await page.waitForSelector(".caps-edit");
+        assert.equal(await page.evaluate(() => document.activeElement?.id), await page.locator(".caps-edit input").first().getAttribute("id"), "focus moves to the first cap");
+        assert.equal(await page.inputValue(".caps-edit input >> nth=0"), "10");
+        assert.equal(await page.inputValue(".caps-edit input >> nth=1"), "3");
+        await assertNoHorizontalScroll(page, "caps editor");
+        await page.locator(".caps-edit").scrollIntoViewIfNeeded();
+        await shot(page, "caps-edit-light");
+        await assertTapTargets(page, [".caps-edit input", ".caps-edit button"], "caps editor");
+        await page.fill(".caps-edit input >> nth=1", "25");
+        await page.click(".caps-edit button:has-text('Save caps')");
+        await page.waitForFunction(() => document.querySelector(".caps-edit .form-error")?.textContent.length > 0);
+        assert.match(await text(page, ".caps-edit .form-error"), /Review rounds: enter a whole number from 1 to 20/);
+        await page.fill(".caps-edit input >> nth=1", "5");
+        const [res] = await Promise.all([waitPost(page, "/api/call/build_control"), page.click(".caps-edit button:has-text('Save caps')")]);
+        assert.equal((await res.json()).ok, true);
+        assert.deepEqual(controls, [{ build_id: id, action: "set_caps", caps: { max_review_rounds: 5 } }]);
+        await page.waitForSelector(".toast:has-text('Caps updated')");
+        await page.waitForSelector(".caps-edit", { state: "detached" });
+        await page.waitForFunction(() => document.querySelector(".info")?.textContent.includes("5 per task"));
+        build = (await sd.ledger(id)).build;
+        assert.deepEqual(build.caps, { max_messages: 10, max_review_rounds: 5 });
+        assert.equal((await sd.ledger(id)).tasks[0].max_rounds, 5, "open tasks follow the new review cap");
+        s.check({ allow: [409] }); // the refused plain Resume at the cap
       } finally {
         await s.close();
       }
@@ -1227,7 +1518,7 @@ describe("ledger page against a real relay", { skip: MISSING_PLAYWRIGHT, timeout
       });
       const design = await sd.task(id, { title: "Design system and home screen", assignee: "creative-director", reviewer: null, description: "Type scale, colour tokens, the home screen in light and dark." });
       const home = await sd.task(id, { title: "Build the home screen", description: "Implement the home screen from the design spec; deploy a preview per round." });
-      await sd.task(id, { title: "Deploy v1", reviewer: null });
+      await sd.task(id, { title: "Deploy v1", reviewer: null, dependsOn: [home] });
       const plan = await sd.requestPlan(id, "Three tasks:\n1. T1 Creative Director designs the system and home screen.\n2. T2 Developer builds it; the Creative Director reviews each preview.\n3. T3 Developer deploys v1.");
       await sd.call("human", "gate_decide", { build_id: id, gate_id: plan, decision: "approved", note: "Keep it to three habits." });
       const figma = [{ url: "https://www.figma.com/file/habit-tracker", label: "Figma: Habit tracker" }];
@@ -1256,9 +1547,16 @@ describe("ledger page against a real relay", { skip: MISSING_PLAYWRIGHT, timeout
           await page.click(`.build-card[href="#${id}"]`);
           await page.waitForSelector(".gate select");
           await page.screenshot({ path: join(SHOTS_DIR, `detail-gate-${scheme}.png`) });
+          // The whole gate card, clipped from a full-page shot so the sticky top bar does not cover it.
+          const gateBox = await page.evaluate(() => {
+            const r = document.querySelector(".gate").getBoundingClientRect();
+            return { x: r.x, y: r.y + window.scrollY, width: r.width, height: r.height };
+          });
+          await page.screenshot({ path: join(SHOTS_DIR, `detail-gate-card-${scheme}.png`), fullPage: true, clip: gateBox });
           await page.screenshot({ path: join(SHOTS_DIR, `detail-full-${scheme}.png`), fullPage: true });
           await page.click("#nav-spike");
           await page.waitForSelector(".event");
+          await page.selectOption("#wake-role", "developer");
           await page.screenshot({ path: join(SHOTS_DIR, `spike-${scheme}.png`), fullPage: true });
           await page.click("#nav-builds");
           await page.waitForSelector("#kill-on");

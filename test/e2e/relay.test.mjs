@@ -34,8 +34,8 @@ import {
 } from "./relay-helpers.mjs";
 
 const REPO = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
-const PROTOCOL = readFileSync(join(REPO, "protocol/PROTOCOL.md"), "utf8");
-const ADDENDA = Object.fromEntries(ROLES.map((role) => [role, readFileSync(join(REPO, `protocol/roles/${role}.md`), "utf8")]));
+// DESIGN §10: initialize.instructions is the role's digest; the full protocol lives in the Project instructions.
+const MCP_INSTRUCTIONS = Object.fromEntries(ROLES.map((role) => [role, readFileSync(join(REPO, `protocol/mcp/${role}.md`), "utf8")]));
 
 // DESIGN §10, Tools table, "Roles" column.
 const TOOLS_BY_ROLE = {
@@ -113,11 +113,8 @@ describe("1. connect, initialize and tools/list for every role", { concurrency: 
           assert.deepEqual(client.getServerVersion(), { name: "agent-relay", version });
           assert.deepEqual(client.getServerCapabilities()?.tools, { listChanged: false });
           const instructions = client.getInstructions() ?? "";
-          assert.ok(instructions.includes(PROTOCOL.trim()), "instructions contain protocol/PROTOCOL.md");
-          assert.ok(instructions.includes(ADDENDA[role].trim()), `instructions contain protocol/roles/${role}.md`);
-          for (const other of ROLES.filter((r) => r !== role)) {
-            assert.ok(!instructions.includes(ADDENDA[other].trim()), `instructions leave out the ${other} addendum`);
-          }
+          assert.equal(instructions, MCP_INSTRUCTIONS[role].trim(), `instructions are protocol/mcp/${role}.md`);
+          assert.ok(instructions.length <= 4096, "instructions fit the 4,096 characters clients keep");
 
           const { tools } = await client.listTools();
           assert.deepEqual(tools.map((t) => t.name).sort(), [...TOOLS_BY_ROLE[role]].sort(), `${role} tools`);
@@ -305,6 +302,9 @@ describe("2. PRD core workflow: kickoff brief to shipped v1", { concurrency: 1 }
       depends_on: ["T1"],
     });
     assertFields(t2, { id: "T2", assignee: "developer", owner: "developer", reviewer: "creative-director", status: "todo", depends_on: ["T1"] });
+    // DESIGN §5: a task is ready once every depends_on task is done or cancelled.
+    assertFields(t1, { ready: true, waiting_on: [] });
+    assertFields(t2, { ready: false, waiting_on: ["T1"] });
 
     // Planning: agents may not send work messages, and only the orchestrator or the human creates tasks.
     await o.fails("send", { build_id: buildId, to_role: "creative-director", type: "task", task_id: "T1", body: "Start" }, "conflict");
@@ -439,10 +439,13 @@ describe("2. PRD core workflow: kickoff brief to shipped v1", { concurrency: 1 }
     assertFields(task, { assignee: "developer", owner: "developer", status: "todo", artifacts: [SPEC] });
 
     await assertNoUnread([o, cd, human], buildId);
-    const { entry } = await deliver(dev, buildId, [{ id: message.id, from: "creative-director", type: "handoff", links: [SPEC] }], {
+    const { entry } = await deliver(dev, buildId, [{ id: message.id, from: "creative-director", type: "handoff", links: [SPEC], next_task_id: null }], {
       sessionRef: "dev-thread",
     });
-    assert.deepEqual(entry.my_tasks.map((t) => t.id), ["T1", "T2"]);
+    assert.deepEqual(entry.my_tasks.map((t) => [t.id, t.ready, t.waiting_on]), [
+      ["T1", true, []],
+      ["T2", false, ["T1"]],
+    ]);
 
     await cd.fails("ledger_update", { build_id: buildId, task_id: "T1", status: "in_progress" }, "forbidden");
     const { task: building } = await dev.call("ledger_update", { build_id: buildId, task_id: "T1", status: "in_progress", note: "Building from the spec" });
@@ -461,6 +464,9 @@ describe("2. PRD core workflow: kickoff brief to shipped v1", { concurrency: 1 }
   step("7 the developer requests review (round 1) with the preview link", async () => {
     await dev.fails("ledger_update", { build_id: buildId, task_id: "T1", status: "done" }, "forbidden");
     await dev.fails("send", { build_id: buildId, to_role: "creative-director", type: "review_request", task_id: "T1", body: "No link" }, "invalid_input");
+    // DESIGN §6: the review goes to the task's reviewer; only the orchestrator or the human change reviewers.
+    const rerouted = await dev.fails("send", { build_id: buildId, to_role: "orchestrator", type: "review_request", task_id: "T1", body: "Quicker?", links: [PREVIEW_1] }, "forbidden");
+    assert.match(rerouted.message, /reviewer is creative-director/);
     const { message, task } = await dev.call("send", {
       build_id: buildId,
       to_role: "cd",
@@ -472,6 +478,11 @@ describe("2. PRD core workflow: kickoff brief to shipped v1", { concurrency: 1 }
     assertFields(message, { from: "developer", to: "creative-director", type: "review_request", links: [PREVIEW_1, COMMIT_1] });
     assertFields(task, { round: 1, reviewer: "creative-director", owner: "creative-director", status: "in_review", artifacts: [SPEC, PREVIEW_1, COMMIT_1] });
     await dev.fails("send", { build_id: buildId, to_role: "orchestrator", type: "handoff", task_id: "T1", body: "Take it", links: [SPEC] }, "forbidden");
+    // A second request while in review would burn a round: refused, even from the orchestrator.
+    for (const agent of [dev, o]) {
+      const again = await agent.fails("send", { build_id: buildId, to_role: "creative-director", type: "review_request", task_id: "T1", body: "Again", links: [PREVIEW_1] }, "conflict");
+      assert.equal(again.message, "T1 is already in review with creative-director (round 1); wait for the verdict");
+    }
 
     await assertNoUnread([o, dev, human], buildId);
     await deliver(cd, buildId, [{ id: message.id, from: "developer", type: "review_request", task_id: "T1" }]);
@@ -486,6 +497,15 @@ describe("2. PRD core workflow: kickoff brief to shipped v1", { concurrency: 1 }
   step("8 the creative director requests changes: the task goes back to the developer", async () => {
     await cd.fails("send", { build_id: buildId, to_role: "developer", type: "verdict", task_id: "T1", verdict: "changes_requested", body: "Fix" }, "invalid_input");
     await dev.fails("send", { build_id: buildId, to_role: "creative-director", type: "verdict", task_id: "T1", verdict: "approved", body: "LGTM" }, "forbidden");
+    // The verdict goes to the assignee, who acts on it.
+    const misrouted = await cd.fails("send", { build_id: buildId, to_role: "orchestrator", type: "verdict", task_id: "T1", verdict: "approved", body: "LGTM" }, "invalid_input");
+    assert.equal(misrouted.message, "send T1's verdict to its assignee (developer), who acts on it");
+    // The reviewer holds the task: notes yes, status changes no. The assignee may add a note meanwhile.
+    const knocked = await cd.fails("ledger_update", { build_id: buildId, task_id: "T1", status: "in_progress" }, "conflict");
+    assert.equal(knocked.message, "T1 is in review: answer it with a verdict");
+    await cd.call("ledger_update", { build_id: buildId, task_id: "T1", note: "Checking on a 360 px phone" });
+    const { task: noted } = await dev.call("ledger_update", { build_id: buildId, task_id: "T1", note: "No login needed on the preview" });
+    assertFields(noted, { status: "in_review", owner: "creative-director" });
     const { message, task } = await cd.call("send", {
       build_id: buildId,
       to_role: "developer",
@@ -553,7 +573,11 @@ describe("2. PRD core workflow: kickoff brief to shipped v1", { concurrency: 1 }
     assertFields(task, { status: "done", owner: null, round: 2 });
     await assertNoUnread([cd, human], buildId);
     const { entry } = await deliver(dev, buildId, [{ id: message.id, from: "creative-director", type: "verdict", verdict: "approved" }]);
-    assert.deepEqual(entry.my_tasks.map((t) => t.id), ["T2"]);
+    assert.deepEqual(entry.my_tasks.map((t) => [t.id, t.ready, t.waiting_on]), [["T2", true, []]], "T2 is ready now that T1 is done");
+    // DESIGN §6, orchestrator notices: the verdict went to the developer, so the relay tells the orchestrator.
+    await deliver(o, buildId, [
+      { from: "relay", type: "status", task_id: "T1", on_behalf_of: null, body: 'T1 "Calculator screen" is done (approved by creative-director in round 2).' },
+    ]);
     // A done task is closed (DESIGN §6: review_request is rejected on done tasks); it also has no owner any more.
     await dev.failsAny("send", { build_id: buildId, to_role: "creative-director", type: "review_request", task_id: "T1", body: "Again", links: [PREVIEW_2] }, ["conflict", "forbidden"]);
 
@@ -587,6 +611,14 @@ describe("2. PRD core workflow: kickoff brief to shipped v1", { concurrency: 1 }
     assertFields(ok.task, { status: "done", owner: null });
     await deliver(dev, buildId, [{ id: ok.message.id, from: "creative-director", type: "verdict", verdict: "approved" }]);
     await assertNoUnread([human], buildId);
+    // The last close: one notice that also asks for final sign-off.
+    await deliver(o, buildId, [
+      {
+        from: "relay",
+        task_id: "T2",
+        body: 'T2 "Ship v1" is done (approved by creative-director in round 1). Every task is closed: request final_signoff.',
+      },
+    ]);
 
     const l = await ledger();
     assert.ok(l.tasks.every((t) => t.status === "done"));
@@ -598,11 +630,12 @@ describe("2. PRD core workflow: kickoff brief to shipped v1", { concurrency: 1 }
     ]);
     const s = await summary();
     assertFields(s, { owners: [], pending_gates: [] });
-    assertFields(s.last_message, { id: ok.message.id, from: "creative-director", to: "developer", type: "verdict" });
+    // The last message is the relay's notice that followed the verdict.
+    assertFields(s.last_message, { id: `M${ok.message.seq + 1}`, from: "relay", to: "orchestrator", type: "status" });
   });
 
   step("12 gate_request final_signoff: the human sees it with the production links", async () => {
-    await drain([o], buildId); // whatever told the orchestrator that every task is closed
+    await assertNoUnread([o], buildId); // step 11 delivered "Every task is closed"
     const { gate, build } = await o.call("gate_request", {
       build_id: buildId,
       kind: "final_signoff",
@@ -632,6 +665,11 @@ describe("2. PRD core workflow: kickoff brief to shipped v1", { concurrency: 1 }
     assertFields(gate, { status: "approved", decided_by: "human" });
     assert.equal(build.status, "shipped");
     await assertNoUnread([cd, dev, human], buildId);
+    // DESIGN §10: a build-less inbox (what the protocol and the inbox Mod call) still carries a closed build
+    // while the caller has unread mail in it, so the sign-off decision reaches the orchestrator.
+    const pending = entryFor(await o.call("inbox", { peek: true }), buildId);
+    assertFields(pending, { status: "shipped" });
+    assert.deepEqual(pending.messages.map((m) => `${m.from}:${m.type}`), ["human:status"]);
     const { messages } = await deliver(o, buildId, [{ from: "human", body: /G2/ }]);
 
     assert.equal(await summary(false), undefined, "build_list leaves shipped builds out by default");
@@ -639,7 +677,7 @@ describe("2. PRD core workflow: kickoff brief to shipped v1", { concurrency: 1 }
     assertFields(closed, { status: "shipped", owners: [], pending_gates: [] });
     assertFields(closed.last_message, { id: messages[0].id, from: "human", to: "orchestrator" });
     const across = await o.call("inbox", {});
-    assert.ok(!across.builds.some((b) => b.build_id === buildId), "inbox without build_id covers only open builds");
+    assert.ok(!across.builds.some((b) => b.build_id === buildId), "once read, the shipped build drops out of the build-less inbox");
 
     await o.fails("send", { build_id: buildId, to_role: "developer", type: "status", body: "Done?" }, "conflict");
     await dev.fails("ledger_update", { build_id: buildId, task_id: "T2", note: "late" }, "conflict");
@@ -672,6 +710,11 @@ describe("2. PRD core workflow: kickoff brief to shipped v1", { concurrency: 1 }
     ]);
     // Human touchpoints: kickoff plus two gate decisions.
     assert.equal(l.messages.filter((m) => m.from === "human").length, 3);
+    assert.deepEqual(
+      l.messages.filter((m) => m.from === "relay" && m.to === "orchestrator").map((m) => m.task_id),
+      ["T1", "T2"],
+      "the orchestrator got one notice per closed task",
+    );
 
     // The one active-build slot is free again.
     const next = await human.call("build_create", { title: "Next", brief: "Another app." });
@@ -753,17 +796,27 @@ describe("3. review cap escalation", { concurrency: 1 }, () => {
     assert.deepEqual(toHuman.entry.my_tasks.map((t) => t.id), ["T1"]);
     assert.deepEqual(toHuman.entry.pending_gates.map((g) => g.id), [gateId]);
     await deliver(o, buildId, [{ from: "relay", task_id: "T1" }]);
-    await deliver(dev, buildId, [{ from: "creative-director", type: "verdict", verdict: "changes_requested" }]);
+    // The assignee is told too, so it waits instead of starting round 4.
+    await deliver(dev, buildId, [
+      { from: "creative-director", type: "verdict", verdict: "changes_requested" },
+      { from: "relay", type: "status", task_id: "T1", body: "T1 escalated to James after round 3; wait for his decision." },
+    ]);
     await assertNoUnread([cd], buildId);
 
-    // The loop is stopped until the human decides.
-    await dev.failsAny(
+    // The loop is stopped until the human decides: no work messages on the task, and the orchestrator may only
+    // cancel it or add notes and links.
+    const held = await dev.fails(
       "send",
       { build_id: buildId, to_role: "creative-director", type: "review_request", task_id: "T1", body: "Round 4", links: [PREVIEW_2] },
-      ["conflict", "forbidden"],
+      "conflict",
     );
+    assert.equal(held.message, `T1 is escalated to James as ${gateId}; wait for the decision`);
     await dev.fails("ledger_update", { build_id: buildId, task_id: "T1", status: "in_progress" }, "forbidden");
     await cd.fails("send", { build_id: buildId, to_role: "developer", type: "verdict", task_id: "T1", verdict: "approved", body: "ok" }, "conflict");
+    await o.fails("send", { build_id: buildId, to_role: "developer", type: "task", task_id: "T1", body: "Try again" }, "conflict");
+    const replan = await o.fails("ledger_update", { build_id: buildId, task_id: "T1", title: "Smaller screen" }, "conflict");
+    assert.match(replan.message, /only cancel it or add notes and links/);
+    await o.call("ledger_update", { build_id: buildId, task_id: "T1", note: "Waiting for James on the header" });
 
     const s = (await human.call("build_list", {})).builds.find((b) => b.build_id === buildId);
     assert.deepEqual(owners(s), [{ task_id: "T1", owner: "human" }]);
@@ -782,9 +835,16 @@ describe("3. review cap escalation", { concurrency: 1 }, () => {
     assertFields(rr.task, { round: 4, status: "in_review" });
     const ok = await cd.call("send", { build_id: buildId, to_role: "developer", type: "verdict", task_id: "T1", verdict: "approved", body: "Finally." });
     assertFields(ok.task, { status: "done", owner: null, round: 4 });
+    await deliver(o, buildId, [
+      {
+        from: "relay",
+        task_id: "T1",
+        body: 'T1 "Calculator screen" is done (approved by creative-director in round 4). Every task is closed: request final_signoff.',
+      },
+    ]);
   });
 
-  step("variant: a rejected escalation leaves the task blocked with the orchestrator", async () => {
+  step("variant: a rejected escalation cancels the task, and the orchestrator is told to plan a narrower one", async () => {
     await human.call("build_control", { build_id: buildId, action: "cancel", reason: "next variant" });
     buildId = await startBuild(team, { caps: { max_review_rounds: 1 } });
     await drain([o, cd, dev, human], buildId);
@@ -797,17 +857,47 @@ describe("3. review cap escalation", { concurrency: 1 }, () => {
 
     const res = await human.call("gate_decide", { build_id: buildId, gate_id: gate.id, decision: "rejected", note: "Cut the scope" });
     assertFields(res.gate, { status: "rejected", note: "Cut the scope" });
-    assertFields(res.task, { status: "blocked", owner: "orchestrator", max_rounds: 1 });
-    const toOrch = await deliver(o, buildId, [{ from: "relay", task_id: "T1" }, { from: "human", task_id: "T1" }]);
+    assertFields(res.task, { status: "cancelled", owner: null, escalated: false, max_rounds: 1 });
+    const toOrch = await deliver(o, buildId, [
+      { from: "relay", task_id: "T1", body: new RegExp(`escalated to James as ${gate.id}`) },
+      { from: "human", task_id: "T1", body: new RegExp(`^Escalation ${gate.id} rejected: T1 "Calculator screen" is cancelled\\.`) },
+      {
+        from: "relay",
+        task_id: "T1",
+        body: "T1 was cancelled; create a narrower replacement task if the work is still needed. Every task is closed: request final_signoff.",
+      },
+    ]);
     assert.ok(toOrch.messages[1].body.includes("Cut the scope"));
-    await deliver(dev, buildId, [{ from: "creative-director", type: "verdict" }, { from: "human", task_id: "T1" }]);
+    await deliver(dev, buildId, [
+      { from: "creative-director", type: "verdict" },
+      { from: "relay", body: "T1 escalated to James after round 1; wait for his decision." },
+      { from: "human", task_id: "T1" },
+    ]);
     await assertNoUnread([cd, human], buildId);
-    assert.deepEqual(owners((await human.call("build_list", {})).builds[0]), [{ task_id: "T1", owner: "orchestrator" }]);
+    assert.deepEqual(owners((await human.call("build_list", {})).builds[0]), []);
 
-    // The orchestrator re-plans: cancel the task (protocol/roles/orchestrator.md).
+    // Nothing moves the cancelled task; the orchestrator plans a narrower replacement instead.
     await dev.failsAny("send", { build_id: buildId, to_role: "creative-director", type: "review_request", task_id: "T1", body: "r2", links: [PREVIEW_2] }, ["conflict", "forbidden"]);
-    const { task } = await o.call("ledger_update", { build_id: buildId, task_id: "T1", status: "cancelled", note: "Rejected at escalation" });
-    assertFields(task, { status: "cancelled", owner: null });
+    await o.fails("send", { build_id: buildId, to_role: "developer", type: "task", task_id: "T1", body: "Again" }, "conflict");
+    const { task } = await o.call("ledger_update", { build_id: buildId, title: "Calculator screen without split", assignee: "developer", reviewer: "creative-director" });
+    assertFields(task, { id: "T2", status: "todo", owner: "developer", round: 0, max_rounds: 1 });
+  });
+
+  step("variant: the orchestrator cancels an escalated task; its gate goes too, so sign-off can follow", async () => {
+    await human.call("build_control", { build_id: buildId, action: "cancel" });
+    buildId = await startBuild(team, { caps: { max_review_rounds: 1 } });
+    await requestReview(1);
+    await requestChanges(1);
+    const gate = (await human.call("ledger_get", { build_id: buildId })).gates.find((g) => g.kind === "escalation");
+    await o.fails("ledger_update", { build_id: buildId, task_id: "T1", status: "in_progress" }, "conflict");
+    const { task } = await o.call("ledger_update", { build_id: buildId, task_id: "T1", status: "cancelled", note: "Dropping the screen" });
+    assertFields(task, { status: "cancelled", owner: null, escalated: false });
+    const l = await human.call("ledger_get", { build_id: buildId });
+    assertFields(l.gates.find((g) => g.id === gate.id), { status: "cancelled" });
+    assertAudit(l.audit, [["orchestrator", /gate\.cancelled/, gate.id]]);
+    await human.fails("gate_decide", { build_id: buildId, gate_id: gate.id, decision: "approved" }, "conflict");
+    const { build } = await o.call("gate_request", { build_id: buildId, kind: "final_signoff", summary: "Nothing left to ship." });
+    assert.equal(build.status, "awaiting_signoff");
   });
 });
 
@@ -824,11 +914,14 @@ describe("4. nudges with real alarms (NUDGE_AFTER_MINUTES=0.05, i.e. 3 s)", { co
   let escalationAt;
 
   const ledgerTask = async () => taskIn(await human.call("ledger_get", { build_id: buildId }), "T1");
-  /** Relay messages about T1 to `agent`, peeked (no side effects). */
-  const relayNotes = async (agent) =>
+  /** Relay messages to `agent` (about `taskId`, or every one when it is undefined), peeked (no side effects). */
+  const relayAbout = async (agent, taskId) =>
     entryFor(await agent.call("inbox", { build_id: buildId, since: 0, peek: true, limit: 100 }), buildId).messages.filter(
-      (m) => m.from === "relay" && m.task_id === "T1",
+      (m) => m.from === "relay" && (taskId === undefined || m.task_id === taskId),
     );
+  const relayNotes = (agent) => relayAbout(agent, "T1");
+  const waitRelay = (agent, match, message) =>
+    waitFor(async () => (await relayAbout(agent)).find((m) => match.test(m.body)), { timeout: 6 * AFTER, message });
   const waitRelayNote = (agent, after, match) =>
     waitFor(
       async () => (await relayNotes(agent)).find((m) => Date.parse(m.created_at) > after && (!match || match.test(m.body))),
@@ -938,6 +1031,7 @@ describe("4. nudges with real alarms (NUDGE_AFTER_MINUTES=0.05, i.e. 3 s)", { co
   test("when the last open task closes, the orchestrator hears about it (it owns the next step: final sign-off)", async () => {
     await human.call("build_control", { build_id: buildId, action: "cancel" });
     const id = await startBuild(team, { tasks: [{ title: "Ship v1", assignee: "developer", reviewer: "creative-director" }] });
+    buildId = id;
     await dev.call("send", { build_id: id, to_role: "creative-director", type: "review_request", task_id: "T1", body: "Production", links: [PRODUCTION] });
     await drain([o, cd, dev, human], id);
     const approved = await cd.call("send", { build_id: id, to_role: "developer", type: "verdict", task_id: "T1", verdict: "approved", body: "Ship it." });
@@ -948,7 +1042,90 @@ describe("4. nudges with real alarms (NUDGE_AFTER_MINUTES=0.05, i.e. 3 s)", { co
       async () => entryFor(await o.call("inbox", { build_id: id, peek: true }), id).messages.find((m) => Date.parse(m.created_at) >= closedAt),
       { timeout: 3 * AFTER, message: "any unread message for the orchestrator within 3 nudge intervals after the last task of an in_progress build closed" },
     );
-    assert.ok(notice);
+    // DESIGN §6: at once, from the relay, in one message.
+    assertFields(notice, {
+      from: "relay",
+      type: "status",
+      task_id: "T1",
+      on_behalf_of: null,
+      body: 'T1 "Ship v1" is done (approved by creative-director in round 1). Every task is closed: request final_signoff.',
+    });
+    assert.ok(Date.parse(notice.created_at) - closedAt < AFTER, "the notice does not wait for a nudge");
+
+    // DESIGN §8 backstop: still no final_signoff request, so a nudge, then the human hears of the stall.
+    const nudge = await waitRelay(o, /^No open tasks for /, "the idle-build nudge to the orchestrator");
+    assertFields(nudge, { to: "orchestrator", task_id: null, on_behalf_of: null, body: /: request final_signoff or add tasks\.$/ });
+    assert.ok(Date.parse(nudge.created_at) - closedAt >= AFTER - SLACK, "the backstop waits NUDGE_AFTER_MINUTES");
+    const stall = await waitRelay(human, /^Stalled: orchestrator missed two nudges/, "the idle-build escalation to the human");
+    assert.ok(Date.parse(stall.created_at) - Date.parse(nudge.created_at) >= AFTER - SLACK);
+    await waitRelay(o, /^Stalled: orchestrator missed two nudges/, "the orchestrator's copy");
+    assertAudit((await human.call("ledger_get", { build_id: id })).audit, [
+      ["relay", /nudge\.sent/, id],
+      ["relay", /nudge\.escalated/, id],
+    ]);
+
+    // Requesting sign-off ends the watch: nothing more arrives.
+    await o.call("gate_request", { build_id: id, kind: "final_signoff", summary: "Shipped." });
+    const requestedAt = Date.now();
+    await sleep(AFTER + 1_000);
+    const late = (await relayAbout(o)).filter((m) => Date.parse(m.created_at) > requestedAt);
+    assert.deepEqual(late.map((m) => m.body), []);
+  });
+
+  test("depends_on: only ready tasks are nudged, and a task's clock starts when its last dependency closes", async () => {
+    await human.call("build_control", { build_id: buildId, action: "cancel" });
+    buildId = await startBuild(team, {
+      tasks: [
+        { title: "Calculator screen", assignee: "developer" },
+        { title: "Ship v1", assignee: "creative-director", depends_on: ["T1"] },
+      ],
+      assign: false,
+    });
+    await o.call("send", { build_id: buildId, to_role: "developer", type: "task", task_id: "T1", body: "Start with the screen." });
+    const waiting = entryFor(await cd.call("inbox", { build_id: buildId, peek: true }), buildId).my_tasks;
+    assert.deepEqual(waiting.map((t) => [t.id, t.ready, t.waiting_on]), [["T2", false, ["T1"]]]);
+
+    // Both tasks have been idle for the same time, but only T1 (ready) is nudged.
+    await waitFor(async () => (await relayNotes(dev)).find((m) => /^Nudge: T1/.test(m.body)), { timeout: 6 * AFTER, message: "the T1 nudge" });
+    await sleep(500);
+    assert.deepEqual((await relayAbout(cd, "T2")).map((m) => m.body), [], "T2 waits on T1, so it is not nudged");
+
+    const { task } = await dev.call("ledger_update", { build_id: buildId, task_id: "T1", status: "done" });
+    const closedAt = Date.parse(task.updated_at);
+    const t2 = taskIn(await human.call("ledger_get", { build_id: buildId }), "T2");
+    assertFields(t2, { ready: true, waiting_on: [], nudge_count: 0 });
+    assert.ok(Date.parse(t2.last_activity_at) >= closedAt, "T2's idle clock restarted when T1 closed");
+    const toCd = await waitFor(async () => (await relayAbout(cd, "T2")).find((m) => /^Nudge: T2/.test(m.body)), {
+      timeout: 6 * AFTER,
+      message: "the T2 nudge once T1 is done",
+    });
+    assert.ok(Date.parse(toCd.created_at) - closedAt >= AFTER - SLACK, "the T2 nudge counts from T1's close");
+  });
+
+  test("an owner busy anywhere in the build is not nudged; once quiet it gets one nudge listing every idle task", async () => {
+    await human.call("build_control", { build_id: buildId, action: "cancel" });
+    buildId = await startBuild(team, {
+      tasks: [
+        { title: "Screen A", assignee: "developer" },
+        { title: "Screen B", assignee: "developer" },
+      ],
+    });
+    // The developer writes on T1 only, every half interval, for two intervals: T2 sits idle meanwhile.
+    let lastWrite = 0;
+    for (const until = Date.now() + 2 * AFTER; Date.now() < until; ) {
+      const { task } = await dev.call("ledger_update", { build_id: buildId, task_id: "T1", note: "Still on screen A" });
+      lastWrite = Date.parse(task.updated_at);
+      await sleep(AFTER / 2);
+    }
+    assert.deepEqual((await relayAbout(dev)).map((m) => m.body), [], "no nudges while the developer is active");
+
+    const nudge = await waitRelay(dev, /^Nudge: you own 2 idle tasks/, "one nudge for both idle tasks");
+    assertFields(nudge, { on_behalf_of: "orchestrator", task_id: "T1", body: /T1 "Screen A" \(todo, idle [^)]+\); T2 "Screen B" \(todo, idle / });
+    assert.ok(Date.parse(nudge.created_at) - lastWrite >= AFTER - SLACK, "the nudge waits for the owner to be quiet");
+    await sleep(300);
+    assert.equal((await relayAbout(dev)).filter((m) => /^Nudge/.test(m.body)).length, 1, "one nudge, not one per task");
+    const copies = (await relayAbout(o)).filter((m) => /^Nudged developer/.test(m.body));
+    assert.deepEqual(copies.map((m) => m.body.slice(0, 37)), ["Nudged developer about 2 idle tasks: "]);
   });
 });
 
@@ -1001,8 +1178,19 @@ describe("5. loop safety: message cap, burst limit, kill switch, build_control",
     assertFields(capped.build, { status: "halted", caps: { max_messages: 10, max_review_rounds: 3 } });
     const resumed = await human.call("build_control", { build_id: buildId, action: "resume" });
     assertFields(resumed.build, { status: "in_progress", halt_reason: null });
+    // DESIGN §7: resuming wakes the orchestrator and every open task's owner (the developer owns T1).
+    for (const agent of [o, dev]) {
+      const notices = entryFor(await agent.call("inbox", { build_id: buildId }), buildId).messages.filter((m) => m.from === "relay");
+      assert.deepEqual(
+        notices.map((m) => m.body),
+        ["Build resumed by James (was halted: message cap reached). Carry on from the ledger."],
+        `${agent.role} is told the build resumed`,
+      );
+    }
+    const cdNotices = entryFor(await cd.call("inbox", { build_id: buildId, peek: true }), buildId).messages.filter((m) => m.from === "relay");
+    assert.deepEqual(cdNotices, [], "the creative director owns no open task");
     await dev.call("send", status("orchestrator", "Resumed."));
-    assert.equal((await human.call("ledger_get", { build_id: buildId })).build.message_count, 4);
+    assert.equal((await human.call("ledger_get", { build_id: buildId })).build.message_count, 4, "relay notices do not count");
   });
 
   step("burst limit: message BURST_PER_MINUTE+1 from one sender within 60 s is rate_limited, without halting", async () => {
@@ -1044,6 +1232,11 @@ describe("5. loop safety: message cap, burst limit, kill switch, build_control",
     const off = await human.call("kill_switch", { on: false });
     assert.equal(off.halted.global, false);
     assert.equal((await cd.call("inbox", {})).halted.global, false);
+    // Clearing the switch tells the orchestrator and the owner of every open task (T1: the developer).
+    for (const agent of [o, dev]) {
+      const told = entryFor(await agent.call("inbox", { build_id: buildId, peek: true }), buildId).messages.filter((m) => m.from === "relay");
+      assert.deepEqual(told.map((m) => m.body), ["Relay kill switch cleared by James. Carry on from the ledger."], `${agent.role} is told`);
+    }
     await o.call("send", status("developer", "Back to work."));
     await o.call("ledger_update", { build_id: buildId, task_id: "T1", reviewer: "creative-director" });
   });
@@ -1080,6 +1273,13 @@ describe("5. loop safety: message cap, burst limit, kill switch, build_control",
     ]);
     assert.ok(!(await human.call("build_list", {})).builds.some((b) => b.build_id === buildId));
     assertFields((await human.call("build_list", { include_closed: true })).builds.find((b) => b.build_id === buildId), { status: "cancelled" });
+    // The resume and cancel notices reach the orchestrator through its build-less inbox once; then the build drops out.
+    const closing = entryFor(await o.call("inbox", {}), buildId);
+    assertFields(closing, { status: "cancelled" });
+    assert.deepEqual(
+      closing.messages.filter((m) => m.from === "relay").map((m) => m.body).slice(-2),
+      ["Build resumed by James (was halted: pause for review). Carry on from the ledger.", "Build cancelled by James: scrapped. Stop work on it."],
+    );
     assert.ok(!(await o.call("inbox", {})).builds.some((b) => b.build_id === buildId));
   });
 
@@ -1103,6 +1303,22 @@ describe("5. loop safety: message cap, burst limit, kill switch, build_control",
     assert.deepEqual(burst.filter((r) => r.ok).length, 4, "exactly BURST_PER_MINUTE accepted");
     assert.ok(burst.filter((r) => !r.ok).every((r) => r.status === 429 && r.error.code === "rate_limited"));
     await human.call("build_control", { build_id: burstId, action: "cancel" });
+  });
+
+  test("write burst: an agent's ledger_update and gate_request calls share a BURST_PER_MINUTE × 3 window per build", async () => {
+    const id = (await human.call("build_create", { title: "Writes", brief: BRIEF })).build_id;
+    const { task } = await o.call("ledger_update", { build_id: id, title: "Screen", assignee: "developer" });
+    for (let i = 2; i <= 12; i += 1) await o.call("ledger_update", { build_id: id, task_id: task.id, note: `note ${i}` });
+    const over = await relay.call("orchestrator", "gate_request", { build_id: id, kind: "plan_approval", summary: "Plan" });
+    assert.deepEqual([over.status, over.error?.code], [429, "rate_limited"]);
+    assert.match(over.error.message, /limit 12/);
+    await o.fails("ledger_update", { build_id: id, task_id: task.id, note: "one more" }, "rate_limited");
+    await dev.call("ledger_update", { build_id: id, task_id: task.id, note: "other roles are unaffected" });
+    await human.call("ledger_update", { build_id: id, task_id: task.id, note: "so is the human" });
+    const l = await human.call("ledger_get", { build_id: id });
+    assertFields(l.build, { status: "planning", message_count: 0 });
+    assert.equal(taskIn(l, task.id).notes.length, 13);
+    await human.call("build_control", { build_id: id, action: "cancel" });
   });
 });
 
@@ -1216,6 +1432,11 @@ describe("6. security", { concurrency: 1 }, () => {
     for (const agent of [cd, dev]) {
       await agent.fails("build_create", { title: "x", brief: "x" }, "forbidden");
       await agent.fails("gate_request", { build_id: buildId, kind: "final_signoff", summary: "x" }, "forbidden");
+    }
+    // DESIGN §10: only the human turns gates off or raises caps; the orchestrator may only lower them.
+    for (const extra of [{ gates: { plan_approval: false } }, { gates: { final_signoff: false } }, { caps: { max_messages: 201 } }, { caps: { max_review_rounds: 4 } }]) {
+      const res = await o.fails("build_create", { title: "x", brief: "x", ...extra }, "forbidden");
+      assert.match(res.message, /only James may/, JSON.stringify(extra));
     }
     assert.equal((await human.call("whoami")).halted.global, false, "the refused kill switch call changed nothing");
     // Ledger permissions (DESIGN §10).
@@ -1377,6 +1598,13 @@ describe("7. gate configuration", { concurrency: 1 }, () => {
     assertFields(final.gate, { kind: "final_signoff", status: "approved", auto: true, decided_by: "relay" });
     assert.equal(final.build.status, "shipped");
     await assertNoUnread([human], buildId);
+    // DESIGN §5: an automatic decision sends the orchestrator the message the human's decision would.
+    await deliver(o, buildId, [
+      { from: "human", type: "task", body: BRIEF },
+      { from: "relay", type: "status", body: "Plan auto-approved (plan_approval gate is off). The build is in_progress: assign the first tasks." },
+      { from: "relay", task_id: "T1", body: 'T1 "Script" is done (marked done by developer). Every task is closed: request final_signoff.' },
+      { from: "relay", type: "status", body: "Final sign-off auto-approved (final_signoff gate is off). The build is shipped." },
+    ]);
     const l = await human.call("ledger_get", { build_id: buildId });
     assert.deepEqual(l.gates.map((g) => [g.kind, g.status, g.auto]), [
       ["plan_approval", "approved", true],
@@ -1442,6 +1670,17 @@ describe("7. gate configuration", { concurrency: 1 }, () => {
     const approved = await human.call("gate_decide", { build_id: buildId, gate_id: "G2", decision: "approved" });
     assert.equal(approved.build.status, "in_progress");
     await human.call("build_control", { build_id: buildId, action: "cancel" });
+  });
+
+  test("an orchestrator-created build keeps both gates and caps no higher than the defaults", async () => {
+    await o.fails("build_create", { title: "Mine", brief: BRIEF, gates: { plan_approval: false } }, "forbidden");
+    await o.fails("build_create", { title: "Mine", brief: BRIEF, caps: { max_messages: 500 } }, "forbidden");
+    const build = await o.call("build_create", { title: "Mine", brief: BRIEF, gates: { final_signoff: true }, caps: { max_messages: 40, max_review_rounds: 2 } });
+    assertFields(build, { created_by: "orchestrator", gates: { plan_approval: true, final_signoff: true }, caps: { max_messages: 40, max_review_rounds: 2 } });
+    await o.call("ledger_update", { build_id: build.build_id, title: "Screen", assignee: "developer" });
+    const plan = await o.call("gate_request", { build_id: build.build_id, kind: "plan_approval", summary: "One screen." });
+    assertFields(plan.gate, { status: "pending", auto: false }, "the plan waits for the human");
+    await human.call("build_control", { build_id: build.build_id, action: "cancel" });
   });
 });
 
@@ -1599,8 +1838,8 @@ describe("8. JSON API parity, error envelope and CORS", { concurrency: 1 }, () =
     assert.ok(Date.parse(named.last_polled_at) > Date.parse(before.last_polled_at ?? 0));
   });
 
-  test("CORS: preflight is answered and responses allow any origin without credentials", async () => {
-    for (const path of ["/api/call/send", "/api/inbox", "/mcp"]) {
+  test("CORS: the JSON API and spike endpoints allow any origin without credentials; /mcp sends no CORS headers", async () => {
+    for (const path of ["/api/call/send", "/api/inbox", "/spike/events"]) {
       const res = await fetch(`${relay.url}${path}`, {
         method: "OPTIONS",
         headers: { origin: "https://claude.ai", "access-control-request-method": "POST", "access-control-request-headers": "authorization, content-type" },
@@ -1616,8 +1855,10 @@ describe("8. JSON API parity, error envelope and CORS", { concurrency: 1 }, () =
     assert.equal(okRes.headers.get("access-control-allow-origin"), "*");
     const errRes = await http(relay, "/api/me", { headers: { origin: "https://claude.ai" } });
     assert.equal(errRes.headers.get("access-control-allow-origin"), "*");
+    // MCP clients are not browsers (DESIGN §11).
     const mcpRes = await rpc(relay, { jsonrpc: "2.0", id: 1, method: "ping" });
-    assert.equal(mcpRes.headers.get("access-control-allow-origin"), "*");
+    assert.equal(mcpRes.status, 200);
+    assert.equal(mcpRes.headers.get("access-control-allow-origin"), null);
   });
 
   test("ledger_get keeps the last 50 messages and audit rows, oldest first", async () => {
@@ -1647,12 +1888,18 @@ describe("8. JSON API parity, error envelope and CORS", { concurrency: 1 }, () =
     assert.deepEqual(events.body.result.events.map((e) => e.event), ["SessionStart"]);
     assert.equal((await http(relay, "/spike/events", { method: "POST", body: { event: "x" } })).status, 401);
 
-    assert.equal((await http(relay, "/spike/wake", { method: "POST", role: "developer", body: { text: "wake" } })).status, 403);
-    const targeted = await http(relay, "/spike/wake", { method: "POST", role: "human", body: { session_id: "s-1", text: "check inbox" } });
+    assert.equal((await http(relay, "/spike/wake", { method: "POST", role: "developer", body: { role: "developer", text: "wake" } })).status, 403);
+    const noRole = await http(relay, "/spike/wake", { method: "POST", role: "human", body: { text: "wake" } });
+    assert.deepEqual([noRole.status, noRole.body.error.code], [400, "invalid_input"], "a wake names the role it is for");
+    const targeted = await http(relay, "/spike/wake", { method: "POST", role: "human", body: { role: "developer", session_id: "s-1", text: "check inbox" } });
     assert.equal(targeted.status, 200);
-    await http(relay, "/spike/wake", { method: "POST", role: "human", body: { text: "anyone" } });
+    assertFields(targeted.body.result.wake, { role: "developer", session_id: "s-1" });
+    await http(relay, "/spike/wake", { method: "POST", role: "human", body: { role: "creative-director", text: "anyone" } });
+    // A wake goes only to a poller with that role's token: the developer's session can't take the CD's wake.
+    const wrongRole = await http(relay, "/spike/wake?session_id=s-2", { role: "developer" });
+    assert.deepEqual(wrongRole.body.result.wakes, []);
     const other = await http(relay, "/spike/wake?session_id=s-2", { role: "creative-director" });
-    assert.deepEqual(other.body.result.wakes.map((w) => w.text), ["anyone"], "untargeted wakes go to the first poller");
+    assert.deepEqual(other.body.result.wakes.map((w) => w.text), ["anyone"], "an untargeted wake goes to the first poller of its role");
     const mine = await http(relay, "/spike/wake?session_id=s-1", { role: "developer" });
     assert.deepEqual(mine.body.result.wakes.map((w) => w.text), ["check inbox"]);
     const again = await http(relay, "/spike/wake?session_id=s-1", { role: "developer" });

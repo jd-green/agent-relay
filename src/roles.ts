@@ -44,22 +44,32 @@ export function displayName(actor: Actor, config: Config): string {
   return actor === "human" ? config.humanName : ROLE_INFO[actor].displayName;
 }
 
+/** Names that already mean something: every role id, every fixed alias and `relay`. */
+const RESERVED_NAMES: ReadonlySet<string> = new Set([RELAY, ...ROLES, ...ROLES.flatMap((role) => ROLE_INFO[role].aliases)]);
+
 export function aliases(role: Role, config: Config): string[] {
   const list = [...ROLE_INFO[role].aliases];
   if (role === "human") {
+    // HUMAN_NAME becomes an alias unless it would collide with a role id, an alias or `relay`
+    // (it is still the human's display name).
     const fromName = normalize(config.humanName);
-    if (fromName && fromName !== RELAY && !list.includes(fromName)) list.push(fromName);
+    if (fromName && !RESERVED_NAMES.has(fromName)) list.push(fromName);
   }
   return list;
 }
 
-/** Resolves a canonical role id, alias or display name; returns null for unknown names and `relay`. */
+/**
+ * Resolves a canonical role id, alias or display name; returns null for unknown names and `relay`.
+ * Ids and aliases win over display names, so HUMAN_NAME can never take over another role's name.
+ */
 export function resolveRole(name: string, config: Config): Role | null {
   const key = normalize(name);
+  if (key === RELAY) return null;
   for (const role of ROLES) {
-    if (role === key || aliases(role, config).includes(key) || normalize(displayName(role, config)) === key) {
-      return role;
-    }
+    if (role === key || aliases(role, config).includes(key)) return role;
+  }
+  for (const role of ROLES) {
+    if (normalize(displayName(role, config)) === key) return role;
   }
   return null;
 }

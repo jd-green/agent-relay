@@ -7,6 +7,8 @@ import {
   expectError,
   inProgressBuild,
   ledger,
+  readInbox,
+  relayTo,
   send,
   task,
   useCleanState,
@@ -83,9 +85,10 @@ describe("plan approval gate", () => {
     expect(again.gate.id).toBe("G2");
   });
 
-  it("is auto-approved when the gate is disabled", async () => {
+  it("is auto-approved when the gate is disabled, with the decision message the human would send", async () => {
     const build = await createBuild({ gates: { plan_approval: false } });
     await createTask(build.build_id);
+    await inboxOf("orchestrator", build.build_id);
     const { gate, build: after } = await call("orchestrator", "gate_request", {
       build_id: build.build_id,
       kind: "plan_approval",
@@ -94,6 +97,9 @@ describe("plan approval gate", () => {
     expect(after.status).toBe("in_progress");
     expect(gate).toMatchObject({ status: "approved", auto: true, decided_by: "relay" });
     expect(await inboxOf("human", build.build_id)).toEqual([]);
+    const [notice] = await inboxOf("orchestrator", build.build_id);
+    expect(notice).toMatchObject({ from: "relay", type: "status", task_id: null, on_behalf_of: null });
+    expect(notice.body).toBe("Plan auto-approved (plan_approval gate is off). The build is in_progress: assign the first tasks.");
   });
 });
 
@@ -114,8 +120,9 @@ describe("final sign-off gate", () => {
     expect(open).toContain(active.taskId);
   });
 
-  it("is refused while an escalation is pending", async () => {
+  it("is refused while an escalation is pending; closing the task by another route cancels that gate", async () => {
     const { buildId, taskId } = await inProgressBuild({ caps: { max_review_rounds: 1 } });
+    const other = await createTask(buildId, { title: "Docs", reviewer: null });
     await send("developer", { build_id: buildId, to_role: "cd", type: "review_request", task_id: taskId, links: PREVIEW });
     await send("creative-director", {
       build_id: buildId,
@@ -125,10 +132,18 @@ describe("final sign-off gate", () => {
       verdict: "changes_requested",
       changes: ["Fix contrast"],
     });
-    // James cancels the task directly; the escalation gate is still pending.
-    await call("human", "ledger_update", { build_id: buildId, task_id: taskId, status: "cancelled" });
+    await call("developer", "ledger_update", { build_id: buildId, task_id: other, status: "done" });
     const message = await expectError("orchestrator", "gate_request", { build_id: buildId, kind: "final_signoff", summary: "x" }, "conflict");
-    expect(message).toContain("G2");
+    expect(message).toContain(taskId); // still open (blocked, escalated)
+
+    // James cancels the task directly: its escalation gate goes with it.
+    const { task: cancelled } = await call("human", "ledger_update", { build_id: buildId, task_id: taskId, status: "cancelled" });
+    expect(cancelled).toMatchObject({ status: "cancelled", owner: null, escalated: false });
+    const snapshot = await ledger(buildId);
+    expect(snapshot.gates.find((gate: Json) => gate.kind === "escalation")).toMatchObject({ id: "G2", status: "cancelled" });
+    expect(snapshot.audit.map((row: Json) => [row.actor, row.action, row.target])).toContainEqual(["human", "gate.cancelled", "G2"]);
+    const { build } = await call("orchestrator", "gate_request", { build_id: buildId, kind: "final_signoff", summary: "x" });
+    expect(build.status).toBe("awaiting_signoff");
   });
 
   it("ships when approved and reopens when rejected", async () => {
@@ -151,12 +166,16 @@ describe("final sign-off gate", () => {
     await expectError("human", "build_control", { build_id: buildId, action: "halt" }, "conflict");
   });
 
-  it("ships immediately when the gate is disabled", async () => {
+  it("ships immediately when the gate is disabled, and tells the orchestrator", async () => {
     const { buildId, taskId } = await inProgressBuild({ gates: { plan_approval: false, final_signoff: false } });
     await call("orchestrator", "ledger_update", { build_id: buildId, task_id: taskId, status: "cancelled" });
+    await inboxOf("orchestrator", buildId);
     const { build, gate } = await call("orchestrator", "gate_request", { build_id: buildId, kind: "final_signoff", summary: "x" });
     expect(build.status).toBe("shipped");
     expect(gate).toMatchObject({ kind: "final_signoff", status: "approved", auto: true });
+    const [notice] = await inboxOf("orchestrator", buildId);
+    expect(notice).toMatchObject({ from: "relay", type: "status" });
+    expect(notice.body).toBe("Final sign-off auto-approved (final_signoff gate is off). The build is shipped.");
   });
 });
 
@@ -190,6 +209,66 @@ describe("work messages outside in_progress", () => {
   });
 });
 
+describe("orchestrator notices", () => {
+  it("tells the orchestrator when someone else closes a task, and asks for sign-off once every task is closed", async () => {
+    const { buildId, taskId } = await inProgressBuild();
+    const docs = await createTask(buildId, { title: "Docs", reviewer: null });
+    await readInbox("orchestrator", buildId);
+
+    await send("developer", { build_id: buildId, to_role: "cd", type: "review_request", task_id: taskId, links: PREVIEW });
+    const approved = await send("creative-director", { build_id: buildId, to_role: "dev", type: "verdict", task_id: taskId, verdict: "approved" });
+    expect(approved.message.to).toBe("developer");
+    const [done] = await readInbox("orchestrator", buildId);
+    expect(done).toMatchObject({ from: "relay", to: "orchestrator", type: "status", task_id: taskId, on_behalf_of: null });
+    expect(done.body).toBe('T1 "Main screen" is done (approved by creative-director in round 1).');
+
+    await call("developer", "ledger_update", { build_id: buildId, task_id: docs, status: "done" });
+    const [last] = await readInbox("orchestrator", buildId);
+    expect(last).toMatchObject({ from: "relay", task_id: docs });
+    // One message, not two.
+    expect(last.body).toBe('T2 "Docs" is done (marked done by developer). Every task is closed: request final_signoff.');
+    // Relay notices never count toward the message cap.
+    expect((await ledger(buildId)).build.message_count).toBe(2);
+  });
+
+  it("reports cancels and blocks by others with the reason, but not the orchestrator's own changes", async () => {
+    const { buildId, taskId } = await inProgressBuild();
+    const second = await createTask(buildId, { title: "Docs", reviewer: null });
+    await readInbox("orchestrator", buildId);
+
+    await call("developer", "ledger_update", { build_id: buildId, task_id: taskId, status: "blocked", note: "Waiting for the API key" });
+    const [blocked] = await readInbox("orchestrator", buildId);
+    expect(blocked).toMatchObject({ from: "relay", type: "status", task_id: taskId });
+    expect(blocked.body).toBe("T1 is blocked (developer): Waiting for the API key.");
+
+    await call("human", "ledger_update", { build_id: buildId, task_id: second, status: "cancelled", note: "Out of scope" });
+    const [cancelled] = await readInbox("orchestrator", buildId);
+    expect(cancelled.body).toBe('T2 "Docs" was cancelled by human: Out of scope.');
+
+    // The orchestrator's own close needs no notice, even when it is the last open task.
+    await call("orchestrator", "ledger_update", { build_id: buildId, task_id: taskId, status: "cancelled" });
+    expect(await readInbox("orchestrator", buildId)).toEqual([]);
+  });
+
+  it("says nothing about sign-off while a gate is pending or a task is still open", async () => {
+    const { buildId, taskId } = await inProgressBuild({ caps: { max_review_rounds: 1 } });
+    const docs = await createTask(buildId, { title: "Docs", reviewer: null });
+    await send("developer", { build_id: buildId, to_role: "cd", type: "review_request", task_id: taskId, links: PREVIEW });
+    await send("creative-director", {
+      build_id: buildId,
+      to_role: "dev",
+      type: "verdict",
+      task_id: taskId,
+      verdict: "changes_requested",
+      changes: ["Fix contrast"],
+    });
+    await readInbox("orchestrator", buildId);
+    await call("developer", "ledger_update", { build_id: buildId, task_id: docs, status: "done" });
+    const [notice] = await readInbox("orchestrator", buildId);
+    expect(notice.body).toBe('T2 "Docs" is done (marked done by developer).');
+  });
+});
+
 describe("build_control", () => {
   it("halts and resumes to the previous status", async () => {
     const build = await createBuild();
@@ -202,6 +281,32 @@ describe("build_control", () => {
     const resumed = await call("human", "build_control", { build_id: build.build_id, action: "resume" });
     expect(resumed.build).toMatchObject({ status: "awaiting_plan_approval", status_before_halt: null, halt_reason: null });
     await expectError("human", "build_control", { build_id: build.build_id, action: "resume" }, "conflict");
+  });
+
+  it("tells the orchestrator and every open task's owner when it resumes or cancels a build", async () => {
+    const { buildId, taskId } = await inProgressBuild();
+    await createTask(buildId, { title: "Design", assignee: "creative-director", reviewer: null });
+    await createTask(buildId, { title: "Approve copy", assignee: "human", reviewer: null });
+    await send("developer", { build_id: buildId, to_role: "cd", type: "review_request", task_id: taskId, links: PREVIEW });
+    for (const role of ["orchestrator", "creative-director", "developer", "human"] as const) await readInbox(role, buildId);
+
+    await call("human", "build_control", { build_id: buildId, action: "halt", reason: "Lunch" });
+    expect(await relayTo(buildId, "orchestrator")).toHaveLength(1); // a halt tells nobody (writes fail with halted)
+    await call("human", "build_control", { build_id: buildId, action: "resume" });
+    const resumed = "Build resumed by James (was halted: Lunch). Carry on from the ledger.";
+    // T1 is in review (owner creative-director), T2 is the creative director's, T3 the human's.
+    expect((await readInbox("orchestrator", buildId)).map((m: Json) => m.body)).toEqual([resumed]);
+    expect((await readInbox("creative-director", buildId)).map((m: Json) => [m.from, m.type, m.task_id, m.body])).toEqual([
+      ["relay", "status", null, resumed],
+    ]);
+    expect(await readInbox("developer", buildId)).toEqual([]);
+    expect(await readInbox("human", buildId)).toEqual([]);
+
+    await call("human", "build_control", { build_id: buildId, action: "cancel", reason: "Changed my mind" });
+    const cancelled = "Build cancelled by James: Changed my mind. Stop work on it.";
+    expect((await readInbox("orchestrator", buildId)).map((m: Json) => m.body)).toEqual([cancelled]);
+    expect((await readInbox("creative-director", buildId)).map((m: Json) => m.body)).toEqual([cancelled]);
+    expect(await readInbox("developer", buildId)).toEqual([]);
   });
 
   it("cancels from any non-terminal status and cancels pending gates", async () => {

@@ -9,12 +9,11 @@
 // Nothing is installed: each session loads a Mod from its folder with --plugin-dir, gets the Mod's
 // options through --settings '{"pluginConfigs": {...}}', reads no user/local settings
 // (--setting-sources project, from an empty temp working directory) and only the MCP servers given
-// here (--strict-mcp-config). Tests marked `todo` reproduce known defects: they run and report, but do
-// not fail the suite until the defect is fixed.
+// here (--strict-mcp-config).
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { randomBytes, randomUUID } from "node:crypto";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
+import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { createServer as createNetServer } from "node:net";
 import { tmpdir } from "node:os";
@@ -29,6 +28,8 @@ const KEEP = process.env.LIVE_KEEP === "1";
 const SKIP = process.env.RUN_LIVE === "1" ? false : "set RUN_LIVE=1 to run the live Mod tests (real claude -p sessions; they cost model tokens)";
 
 const nonce = (prefix) => `${prefix}-${randomBytes(4).toString("hex").toUpperCase()}`;
+/** The fingerprint relay-spike records for a value: its SHA-256 prefix and length, never the text. */
+const fingerprint = (text) => ({ sha256: createHash("sha256").update(text).digest("hex").slice(0, 16), length: text.length });
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // --------------------------------------------------------------------------- temp files and children
@@ -290,13 +291,22 @@ describe("relay-spike Mod against a live relay", { skip: SKIP }, () => {
 
     const start = events.find((e) => e.event === "session.start");
     const marker = start.detail.nonce;
-    assert.match(marker, /^[0-9a-f]{8}$/);
+    // Derived from the session id, so a reload of the Mod keeps it.
+    assert.equal(marker, createHash("sha256").update(`relay-spike marker:${run.sessionId}`).digest("hex").slice(0, 8));
     assert.equal(events.find((e) => e.event === "context.injected").detail.nonce, marker);
+    // Which context blocks the conversation carries, with fingerprints (never the text) of the Project block and the directory.
+    const cwd = fingerprint(realpathSync(work));
+    assert.deepEqual(start.detail.cwd, cwd, "session.start fingerprints the directory");
+    const context = events.find((e) => e.event === "prompt.context");
+    assert.ok(context, `no prompt.context record; got ${names.join(", ")}`);
+    assert.ok(Array.isArray(context.detail.blocks) && context.detail.blocks.every((name) => typeof name === "string"), JSON.stringify(context.detail));
+    assert.ok(!context.detail.blocks.includes("attachedProject"), "a terminal session has no attached Project");
+    assert.deepEqual([context.detail.attached_project, context.detail.cwd], [null, cwd]);
     assert.match(run.text(), new RegExp(`MARKER=${marker}`), `the model did not quote the marker ${marker}\n${explain(run)}`);
     assert.match(run.text(), new RegExp(`WORD=${fileSecret}`), "the Read tool really ran");
 
     const raw = JSON.stringify(events);
-    for (const secret of [promptSecret, fileSecret, "quick brown", "notes.txt", relay.tokens.developer, "Read the file"]) {
+    for (const secret of [promptSecret, fileSecret, "quick brown", "notes.txt", relay.tokens.developer, "Read the file", work]) {
       assert.ok(!raw.includes(secret), `a spike record carries ${JSON.stringify(secret)}`);
     }
     t.diagnostic(`session.start detail: ${JSON.stringify(start.detail)} · cost $${cost(run).toFixed(4)}`);
@@ -305,7 +315,7 @@ describe("relay-spike Mod against a live relay", { skip: SKIP }, () => {
   test("a wake queued for a session before it starts is consumed and runs as a second turn", { timeout: 180_000 }, async (t) => {
     const sessionId = randomUUID();
     const word = nonce("WAKE");
-    const queued = await ok(asHuman(relay, "/spike/wake", { method: "POST", body: JSON.stringify({ session_id: sessionId, text: `Spike wake: reply with exactly ${word} and nothing else.` }) }));
+    const queued = await ok(asHuman(relay, "/spike/wake", { method: "POST", body: JSON.stringify({ role: "developer", session_id: sessionId, text: `Spike wake: reply with exactly ${word} and nothing else.` }) }));
     const run = await claude({ sessionId, plugins: { "relay-spike": spikeOptions(relay) }, prompt: "Reply with exactly FIRST-OK and nothing else." }).exited;
     assert.equal(run.code, 0, explain(run));
 
@@ -329,7 +339,7 @@ describe("relay-spike Mod against a live relay", { skip: SKIP }, () => {
       session.send("Reply with exactly READY and nothing else.");
       assert.ok(await session.until((r) => r.results.length >= 1, 90_000), explain(session));
       const queuedAt = Date.now();
-      await ok(asHuman(relay, "/spike/wake", { method: "POST", body: JSON.stringify({ session_id: session.sessionId, text: `Spike wake: reply with exactly ${word} and nothing else.` }) }));
+      await ok(asHuman(relay, "/spike/wake", { method: "POST", body: JSON.stringify({ role: "developer", session_id: session.sessionId, text: `Spike wake: reply with exactly ${word} and nothing else.` }) }));
       // poll_seconds 15 (the minimum): the wake is picked up within one poll and one 5 s tick.
       assert.ok(await session.until((r) => r.results.length >= 2, 60_000), `no turn started by itself\n${explain(session)}`);
       t.diagnostic(`wake started a turn ${((Date.now() - queuedAt) / 1000).toFixed(1)} s after it was queued`);
@@ -342,8 +352,9 @@ describe("relay-spike Mod against a live relay", { skip: SKIP }, () => {
     assert.ok(names.includes("wake.submitted") && names.includes("wake.turn_started"), names.join(", "));
   });
 
-  test("a wake that arrives while a turn runs is consumed and recorded as wake.skipped_busy", { timeout: 180_000 }, async (t) => {
+  test("a wake that arrives while a turn runs is deferred, then submitted once the turn is over", { timeout: 180_000 }, async (t) => {
     const sessionId = randomUUID();
+    const word = nonce("DEFERRED");
     const session = claude({
       sessionId,
       plugins: { "relay-spike": spikeOptions(relay) },
@@ -356,7 +367,8 @@ describe("relay-spike Mod against a live relay", { skip: SKIP }, () => {
       if (session.code !== null) return true;
       const events = await spikeEvents(relay, sessionId);
       if (!events.some((e) => e.event === "tool.call")) return false;
-      wakeId = (await ok(asHuman(relay, "/spike/wake", { method: "POST", body: JSON.stringify({ session_id: sessionId, text: "Spike wake: reply BUSY." }) }))).wake.id;
+      const body = { role: "developer", session_id: sessionId, text: `Spike wake: reply with exactly ${word} and nothing else.` };
+      wakeId = (await ok(asHuman(relay, "/spike/wake", { method: "POST", body: JSON.stringify(body) }))).wake.id;
       return true;
     }, 60_000, 500);
     const run = await session.exited;
@@ -365,10 +377,14 @@ describe("relay-spike Mod against a live relay", { skip: SKIP }, () => {
     assert.ok(wakeId, `the turn never called a tool, so no wake was queued\n${explain(run)}`);
     const events = await spikeEventsAfterEnd(relay, sessionId);
     const names = events.map((e) => e.event);
-    t.diagnostic(`events: ${events.map((e) => `${e.ts.slice(11, 19)} ${e.event}`).join(", ")}`);
-    assert.deepEqual(events.filter((e) => e.event === "wake.skipped_busy").map((e) => e.detail.wake_id), [wakeId], names.join(", "));
-    assert.ok(!names.includes("wake.submitted"), "a busy session must not submit the wake");
-    assert.equal(names.filter((n) => n === "turn.start").length, 1, "no second turn ran");
+    t.diagnostic(`events: ${events.map((e) => `${e.ts.slice(11, 19)} ${e.event}`).join(", ")}; results: ${JSON.stringify(run.results.map((r) => r.result))}`);
+    const wakes = events.filter((e) => e.event.startsWith("wake.")).map((e) => [e.event, e.detail.wake_id]);
+    assert.deepEqual(wakes, [["wake.deferred", wakeId], ["wake.submitted", wakeId], ["wake.turn_started", wakeId]], names.join(", "));
+    const deferredAt = events.findIndex((e) => e.event === "wake.deferred");
+    const submittedAt = events.findIndex((e) => e.event === "wake.submitted");
+    assert.ok(names.slice(deferredAt, submittedAt).includes("turn.complete"), "submitted only after the busy turn completed");
+    assert.equal(names.filter((n) => n === "turn.start").length, 2, "the busy turn, then the wake's turn");
+    assert.match(run.text(), new RegExp(word), `the deferred wake's turn did not answer\n${explain(run)}`);
   });
 
   test("relay down: the turn completes normally and /relay-spike reports the relay unreachable", { timeout: 180_000 }, async () => {
@@ -416,21 +432,29 @@ describe("relay-inbox Mod against a live relay", { skip: SKIP }, () => {
   const message = async (id) => (await ok(relay.call("human", "ledger_get", { build_id: buildId }))).messages.find((m) => m.id === id);
   const inboxOf = async (role) => (await ok(relay.call(role, "inbox", { build_id: buildId, since: 0, peek: true, limit: 100 }))).builds[0].messages;
 
-  test("an unread message reaches the model with the next prompt and the relay marks it read", { timeout: 180_000 }, async (t) => {
+  test("the next prompt carries the unread messages, and exactly those are marked read on the relay", { timeout: 180_000 }, async (t) => {
     await drain();
-    const word = nonce("INBOX");
-    const sent = await tell(`Live check: the codeword is ${word}. Please confirm you can see it.`);
+    const words = [nonce("INBOX"), nonce("INBOX")];
+    const sent = [];
+    for (const word of words) sent.push(await tell(`Live check: the codeword is ${word}. Please confirm you can see it.`));
+    const unreadBefore = (await ok(relay.call("human", "ledger_get", { build_id: buildId }))).messages.filter((m) => m.to === "developer" && m.read_at === null).map((m) => m.id);
+    assert.deepEqual(unreadBefore, sent.map((m) => m.id));
     const run = await claude({
       plugins: { "relay-inbox": inboxOptions(relay) },
-      prompt: "Is there an Agent Relay inbox message in your context? If so reply with exactly CODEWORD=<the codeword from its body>, otherwise CODEWORD=none. Do not use tools.",
+      prompt:
+        "List the codewords of every Agent Relay inbox message in your context, oldest first: reply with exactly " +
+        "CODEWORDS=<codewords, comma-separated> or CODEWORDS=none. Do not use tools.",
     }).exited;
     assert.equal(run.code, 0, explain(run));
-    t.diagnostic(`statuses: ${JSON.stringify(run.statusTexts("relay-inbox"))}`);
-    assert.match(run.text(), new RegExp(`CODEWORD=${word}`), explain(run));
-    assert.ok(run.statusTexts("relay-inbox").some((s) => /^Relay · 1 unread · b-/.test(s)), "the status line counted the unread message");
-    const row = await message(sent.id);
-    assert.ok(row.read_at, `${sent.id} was not marked read`);
-    const thread = (await ok(relay.call("human", "ledger_get", { build_id: buildId }))).threads.find((th) => th.role === "developer");
+    t.diagnostic(`statuses: ${JSON.stringify(run.statusTexts("relay-inbox"))} · answer: ${run.text()}`);
+    assert.match(run.text(), new RegExp(`CODEWORDS=${words[0]}, ?${words[1]}`), explain(run));
+    // The read state matches what the model was handed: the run marked read exactly the two messages it quoted.
+    const ledger = await ok(relay.call("human", "ledger_get", { build_id: buildId }));
+    const markedByRun = ledger.messages.filter((m) => unreadBefore.includes(m.id) && m.read_at !== null).map((m) => m.id);
+    assert.deepEqual(markedByRun, sent.map((m) => m.id));
+    assert.deepEqual(ledger.messages.filter((m) => m.to === "developer" && m.read_at === null).map((m) => m.id), [], "nothing left unread");
+    assert.ok(run.statusTexts("relay-inbox").some((s) => /^Relay · 2 unread · b-/.test(s)), "the status line counted the unread messages");
+    const thread = ledger.threads.find((th) => th.role === "developer");
     assert.equal(thread.session_ref, run.sessionId, "the poll recorded the session as the developer's presence");
   });
 
@@ -531,9 +555,9 @@ describe("relay-inbox Mod against a live relay", { skip: SKIP }, () => {
       const slow = await claude({ plugins: { "relay-inbox": inboxOptions(relay, "developer", { relay_url: hang.url }) }, prompt }).exited;
       assert.equal(slow.code, 0, explain(slow));
       assert.match(slow.text(), /OK-FAIL/);
-      assert.ok(slow.statusTexts("relay-inbox").some((s) => s.includes("unreachable (timeout: no answer within 8s)")), explain(slow));
-      // The Mod gives up after 8 s, but $.http.fetch cannot be aborted: the process exits only when the
-      // engine's own request timeout (~30 s) ends the abandoned request.
+      assert.ok(slow.statusTexts("relay-inbox").some((s) => s.includes("unreachable (timeout: no answer within 3s)")), explain(slow));
+      // The Mod gives up after 3 s (a prompt waits at most 1.5 s), but $.http.fetch cannot be aborted: the
+      // process exits only when the engine's own request timeout (~30 s) ends the abandoned request.
       t.diagnostic(`hanging relay: the -p run took ${(slow.ms / 1000).toFixed(1)} s (relay down: ${(down.ms / 1000).toFixed(1)} s)`);
       assert.ok(slow.ms < 60_000, `took ${slow.ms} ms`);
     } finally {
@@ -541,58 +565,50 @@ describe("relay-inbox Mod against a live relay", { skip: SKIP }, () => {
     }
   });
 
-  test(
-    "a message marked read alongside an injected batch reaches the model (known defect: it is 'carried' and never handed over by a wake)",
-    { timeout: 240_000, todo: "relay-inbox markRead marks every unread message read, but carried ones only ride a prompt that passes the Mod's own prompt.submit hook" },
-    async (t) => {
-      await drain();
-      const first = nonce("CARRYA");
-      const second = nonce("CARRYB");
-      const a = await tell(`Carry check A: codeword ${first}.`);
-      const session = claude({ stdin: true, plugins: { "relay-inbox": inboxOptions(relay) }, mcp: { relay, role: "developer" }, maxTurns: 8 });
-      let b;
-      try {
-        // Once the first poll has listed A, B arrives and the person types a prompt: A is injected, A and B are marked read.
-        assert.ok(await session.until((r) => r.statusTexts("relay-inbox").some((s) => /1 unread/.test(s)), 30_000), explain(session));
-        b = await tell(`Carry check B: codeword ${second}. Send me (orchestrator) a status message containing it.`);
-        session.send("Reply with exactly READY and nothing else. Do not use tools this turn.");
-        assert.ok(await session.until((r) => r.results.length >= 1, 90_000), explain(session));
-        // The Mod still shows B as unread and wakes the session for it.
-        await session.until((r) => r.results.length >= 2, 60_000);
-      } finally {
-        session.end();
-        await session.exited;
-      }
-      t.diagnostic(`A read_at ${(await message(a.id)).read_at} · B read_at ${(await message(b.id)).read_at} · results ${JSON.stringify(session.results.map((r) => r.result))}`);
-      const answered = (await inboxOf("orchestrator")).some((m) => m.from === "developer" && m.body.includes(second));
-      assert.ok(answered || session.text().includes(second), `B (${b.id}) was marked read but the model never saw ${second}`);
-    },
-  );
+  test("a message that arrives after the last poll rides the same prompt: the prompt makes its own read", { timeout: 240_000 }, async (t) => {
+    await drain();
+    const first = nonce("LATEA");
+    const second = nonce("LATEB");
+    const a = await tell(`Carry check A: codeword ${first}.`);
+    const session = claude({ stdin: true, plugins: { "relay-inbox": inboxOptions(relay, "developer", { auto_wake: false }) }, maxTurns: 4 });
+    let b;
+    try {
+      // The first poll lists A only; then B arrives and the person types a prompt.
+      assert.ok(await session.until((r) => r.statusTexts("relay-inbox").some((s) => /1 unread/.test(s)), 30_000), explain(session));
+      b = await tell(`Carry check B: codeword ${second}.`);
+      session.send("List the codewords of every Agent Relay inbox message in your context, oldest first: reply with exactly CODEWORDS=<codewords, comma-separated>. Do not use tools.");
+      assert.ok(await session.until((r) => r.results.length >= 1, 90_000), explain(session));
+    } finally {
+      session.end();
+      await session.exited;
+    }
+    t.diagnostic(`A read_at ${(await message(a.id)).read_at} · B read_at ${(await message(b.id)).read_at} · results ${JSON.stringify(session.results.map((r) => r.result))}`);
+    assert.match(session.text(), new RegExp(`CODEWORDS=${first}, ?${second}`), explain(session));
+    assert.ok((await message(a.id)).read_at && (await message(b.id)).read_at, "both handed over, both read");
+  });
 
-  test(
-    "messages injected while the kill switch is on are still unread once it is cleared (known defect)",
-    { timeout: 180_000, todo: "relay-inbox injects and marks read messages while the relay is halted, without telling the model it is halted" },
-    async (t) => {
-      await drain();
-      const word = nonce("HALTED");
-      const sent = await tell(`Kill switch check: codeword ${word}.`);
-      await ok(relay.call("human", "kill_switch", { on: true, reason: "live Mod check" }));
-      let run;
-      try {
-        run = await claude({
-          plugins: { "relay-inbox": inboxOptions(relay) },
-          prompt: "If an Agent Relay inbox message is in your context, reply SEEN=<its codeword> HALTED=<yes|no|unknown: is the relay halted?>; otherwise SEEN=none.",
-        }).exited;
-      } finally {
-        await ok(relay.call("human", "kill_switch", { on: false }));
-      }
-      assert.equal(run.code, 0, explain(run));
-      assert.ok(run.statusTexts("relay-inbox").some((s) => s.startsWith("Relay · halted: live Mod check")), explain(run));
-      t.diagnostic(`model: ${run.text()} · ${sent.id} read_at ${(await message(sent.id)).read_at}`);
-      const unread = (await ok(relay.call("developer", "inbox", { build_id: buildId, peek: true }))).builds[0].messages.map((m) => m.id);
-      assert.ok(unread.includes(sent.id), `${sent.id} was consumed during the halt and is gone from the inbox after resume`);
-    },
-  );
+  test("while the kill switch is on, a prompt carries no relay messages and they are still unread once it is cleared", { timeout: 180_000 }, async (t) => {
+    await drain();
+    const word = nonce("HALTED");
+    const sent = await tell(`Kill switch check: codeword ${word}.`);
+    await ok(relay.call("human", "kill_switch", { on: true, reason: "live Mod check" }));
+    let run;
+    try {
+      run = await claude({
+        plugins: { "relay-inbox": inboxOptions(relay) },
+        prompt: "If an Agent Relay inbox message is in your context, reply SEEN=<its codeword>; otherwise reply exactly SEEN=none. Do not use tools.",
+      }).exited;
+    } finally {
+      await ok(relay.call("human", "kill_switch", { on: false }));
+    }
+    assert.equal(run.code, 0, explain(run));
+    assert.ok(run.statusTexts("relay-inbox").some((s) => s.startsWith("Relay · halted: live Mod check · 1 unread")), explain(run));
+    t.diagnostic(`model: ${run.text()} · ${sent.id} read_at ${(await message(sent.id)).read_at}`);
+    assert.ok(!run.text().includes(word), `the model was handed ${word} during the halt`);
+    assert.equal((await message(sent.id)).read_at, null, `${sent.id} was marked read during the halt`);
+    const unread = (await ok(relay.call("developer", "inbox", { build_id: buildId, peek: true }))).builds[0].messages.map((m) => m.id);
+    assert.ok(unread.includes(sent.id), `${sent.id} is gone from the inbox after the halt`);
+  });
 });
 
 // =========================================================================== relay-inbox and nudges
@@ -606,31 +622,30 @@ describe("relay-inbox /relay-reply to a nudge", { skip: SKIP }, () => {
     await relay?.stop();
   });
 
-  test(
-    "counts as activity on the nudged task, so it does not escalate to the human (known defect)",
-    { timeout: 180_000, todo: "relay-inbox replies without task_id, and the relay counts only messages that name the task" },
-    async (t) => {
-      const build = await ok(relay.call("human", "build_create", { title: "Nudge reply", brief: "x", gates: { plan_approval: false, final_signoff: false } }));
-      const task = (await ok(relay.call("orchestrator", "ledger_update", { build_id: build.build_id, title: "Build the list screen", assignee: "developer" }))).task;
-      await ok(relay.call("orchestrator", "gate_request", { build_id: build.build_id, kind: "plan_approval", summary: "One task." }));
-      const nudge = await waitFor(async () => {
-        const box = await ok(relay.call("developer", "inbox", { build_id: build.build_id, peek: true }));
-        return box.builds[0].messages.find((m) => m.from === "relay");
-      }, 60_000, 1_000);
-      assert.ok(nudge, "no nudge arrived");
-      assert.deepEqual([nudge.task_id, nudge.on_behalf_of], [task.id, "orchestrator"]);
+  test("counts as activity on the nudged task (the reply names it), so it does not escalate to the human", { timeout: 180_000 }, async (t) => {
+    const build = await ok(relay.call("human", "build_create", { title: "Nudge reply", brief: "x", gates: { plan_approval: false, final_signoff: false } }));
+    const task = (await ok(relay.call("orchestrator", "ledger_update", { build_id: build.build_id, title: "Build the list screen", assignee: "developer" }))).task;
+    await ok(relay.call("orchestrator", "gate_request", { build_id: build.build_id, kind: "plan_approval", summary: "One task." }));
+    const nudge = await waitFor(async () => {
+      const box = await ok(relay.call("developer", "inbox", { build_id: build.build_id, peek: true }));
+      return box.builds[0].messages.find((m) => m.from === "relay" && m.task_id === task.id);
+    }, 60_000, 1_000);
+    assert.ok(nudge, "no nudge arrived");
+    assert.deepEqual([nudge.task_id, nudge.on_behalf_of], [task.id, "orchestrator"]);
 
-      const run = await claude({ plugins: { "relay-inbox": inboxOptions(relay) }, prompt: `/relay-reply Working on ${task.id}, list screen half done.` }).exited;
-      assert.equal(run.code, 0, explain(run));
-      assert.match(run.text(), new RegExp(`Sent M\\d+ to orchestrator \\(reply to ${nudge.id}`), explain(run));
+    const run = await claude({ plugins: { "relay-inbox": inboxOptions(relay) }, prompt: `/relay-reply Working on ${task.id}, list screen half done.` }).exited;
+    assert.equal(run.code, 0, explain(run));
+    assert.match(run.text(), new RegExp(`Sent M\\d+ to orchestrator \\(reply to ${nudge.id}`), explain(run));
 
-      await sleep(20_000); // past the second-miss window (15 s after the nudge)
-      const ledger = await ok(relay.call("human", "ledger_get", { build_id: build.build_id }));
-      const reply = ledger.messages.find((m) => m.from === "developer");
-      const stalled = ledger.messages.find((m) => m.to === "human" && m.body.startsWith("Stalled:"));
-      t.diagnostic(`reply ${JSON.stringify({ id: reply?.id, task_id: reply?.task_id, reply_to: reply?.reply_to })} · task ${JSON.stringify({ nudge_count: ledger.tasks[0].nudge_count, stalled: ledger.tasks[0].stalled })}`);
-      assert.equal(reply?.task_id, task.id, "the reply names the nudged task");
-      assert.equal(stalled, undefined, `escalated to the human although the owner replied: ${stalled?.body}`);
-    },
-  );
+    await sleep(20_000); // past the second-miss window (15 s after the nudge)
+    const ledger = await ok(relay.call("human", "ledger_get", { build_id: build.build_id }));
+    const reply = ledger.messages.find((m) => m.from === "developer");
+    const stalled = ledger.messages.find((m) => m.to === "human" && m.body.startsWith("Stalled:"));
+    const row = ledger.tasks.find((one) => one.id === task.id);
+    t.diagnostic(`reply ${JSON.stringify({ id: reply?.id, task_id: reply?.task_id, reply_to: reply?.reply_to })} · task ${JSON.stringify({ nudge_count: row.nudge_count, stalled: row.stalled })}`);
+    assert.deepEqual([reply?.task_id, reply?.reply_to, reply?.type], [task.id, nudge.id, "status"], "the reply names the nudged task and the nudge");
+    assert.equal(stalled, undefined, `escalated to the human although the owner replied: ${stalled?.body}`);
+    assert.equal(row.stalled, false);
+    assert.ok(row.nudge_count <= 1, `the reply did not reset the nudges: nudge_count ${row.nudge_count}`);
+  });
 });

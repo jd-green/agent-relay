@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import { PREVIEW, call, createBuild, createTask, expectError, inProgressBuild, send, task, useCleanState } from "./helpers";
 
+const link = (i: number) => ({ url: `https://preview.example.com/${i}` });
+
 useCleanState();
 
 describe("ledger_update: creating tasks", () => {
@@ -98,6 +100,54 @@ describe("ledger_update: permission matrix", () => {
     expect(done).toMatchObject({ status: "done", owner: null });
   });
 
+  it("needs the approval to be for the current round, and no review in progress", async () => {
+    const { buildId, taskId } = await inProgressBuild();
+    await send("developer", { build_id: buildId, to_role: "cd", type: "review_request", task_id: taskId, links: PREVIEW });
+    await send("creative-director", { build_id: buildId, to_role: "dev", type: "verdict", task_id: taskId, verdict: "approved" });
+    await call("orchestrator", "ledger_update", { build_id: buildId, task_id: taskId, status: "in_progress" });
+    await send("developer", { build_id: buildId, to_role: "cd", type: "review_request", task_id: taskId, links: PREVIEW });
+    // Round 2 is in review; round 1's approval does not count.
+    const inReview = await expectError("orchestrator", "ledger_update", { build_id: buildId, task_id: taskId, status: "done" }, "conflict");
+    expect(inReview).toContain("in review");
+    await send("creative-director", {
+      build_id: buildId,
+      to_role: "dev",
+      type: "verdict",
+      task_id: taskId,
+      verdict: "changes_requested",
+      changes: ["Fix it"],
+    });
+    const message = await expectError("orchestrator", "ledger_update", { build_id: buildId, task_id: taskId, status: "done" }, "conflict");
+    expect(message).toContain("approved verdict for its current round (2)");
+  });
+
+  it("refuses to clear the reviewer and then mark a reviewed task done", async () => {
+    const { buildId, taskId } = await inProgressBuild();
+    await send("developer", { build_id: buildId, to_role: "cd", type: "review_request", task_id: taskId, links: PREVIEW });
+    // The reviewer can't change while the review loop runs.
+    for (const reviewer of [null, "orchestrator"]) {
+      await expectError("orchestrator", "ledger_update", { build_id: buildId, task_id: taskId, reviewer }, "conflict");
+    }
+    await send("creative-director", {
+      build_id: buildId,
+      to_role: "dev",
+      type: "verdict",
+      task_id: taskId,
+      verdict: "changes_requested",
+      changes: ["Fix it"],
+    });
+    await expectError("orchestrator", "ledger_update", { build_id: buildId, task_id: taskId, reviewer: null }, "conflict");
+    // Setting the same reviewer again is not a change.
+    await call("orchestrator", "ledger_update", { build_id: buildId, task_id: taskId, reviewer: "creative-director", note: "Same reviewer" });
+
+    // Once the loop is paused the orchestrator may clear it, but round 1 still needs its approval.
+    await call("orchestrator", "ledger_update", { build_id: buildId, task_id: taskId, status: "in_progress" });
+    await call("orchestrator", "ledger_update", { build_id: buildId, task_id: taskId, reviewer: null });
+    await expectError("orchestrator", "ledger_update", { build_id: buildId, task_id: taskId, status: "done" }, "conflict");
+    await expectError("developer", "ledger_update", { build_id: buildId, task_id: taskId, status: "done" }, "conflict");
+    expect((await task(buildId, taskId)).status).toBe("in_progress");
+  });
+
   it("lets the human override anything", async () => {
     const { buildId, taskId } = await inProgressBuild();
     const { task: inReview } = await call("human", "ledger_update", { build_id: buildId, task_id: taskId, status: "in_review" });
@@ -139,10 +189,73 @@ describe("ledger_update: permission matrix", () => {
   it("refuses anyone else", async () => {
     const { buildId, taskId } = await inProgressBuild();
     await expectError("creative-director", "ledger_update", { build_id: buildId, task_id: taskId, note: "Looks good" }, "forbidden");
+    await expectError("human", "ledger_update", { build_id: buildId, task_id: "T2", note: "x" }, "not_found");
+  });
+
+  it("keeps a task in review until the verdict: the reviewer may only add notes and links", async () => {
+    const { buildId, taskId } = await inProgressBuild();
     await send("developer", { build_id: buildId, to_role: "cd", type: "review_request", task_id: taskId, links: PREVIEW });
-    // In review the reviewer owns the task, so the developer is now "anyone else".
-    await expectError("developer", "ledger_update", { build_id: buildId, task_id: taskId, note: "Waiting" }, "forbidden");
-    await call("creative-director", "ledger_update", { build_id: buildId, task_id: taskId, note: "Reviewing" });
+    for (const status of ["in_progress", "todo", "blocked"]) {
+      const message = await expectError("creative-director", "ledger_update", { build_id: buildId, task_id: taskId, status }, "conflict");
+      expect(message).toBe("T1 is in review: answer it with a verdict");
+    }
+    const { task: noted } = await call("creative-director", "ledger_update", {
+      build_id: buildId,
+      task_id: taskId,
+      note: "Reviewing on mobile",
+      links: [{ url: "https://docs.example.com/review-notes" }],
+    });
+    expect(noted).toMatchObject({ status: "in_review", owner: "creative-director" });
+    await send("creative-director", { build_id: buildId, to_role: "dev", type: "verdict", task_id: taskId, verdict: "approved" });
+  });
+
+  it("lets the assignee add links and a note while someone else holds the task", async () => {
+    const { buildId, taskId } = await inProgressBuild();
+    await send("developer", { build_id: buildId, to_role: "cd", type: "review_request", task_id: taskId, links: PREVIEW });
+    const working = { url: "https://preview.example.com/working-link" };
+    const { task: added } = await call("developer", "ledger_update", { build_id: buildId, task_id: taskId, links: [working], note: "Use this link" });
+    expect(added).toMatchObject({ status: "in_review", owner: "creative-director", artifacts: [...PREVIEW, working] });
+    expect(added.notes.at(-1)).toMatchObject({ by: "developer", text: "Use this link" });
+    await expectError("developer", "ledger_update", { build_id: buildId, task_id: taskId, status: "in_progress" }, "forbidden");
+    await expectError("developer", "ledger_update", { build_id: buildId, task_id: taskId, title: "x", note: "y" }, "forbidden");
+  });
+
+  it("keeps at most 50 distinct artifacts and 50 notes per task, each note at most 2,000 chars", async () => {
+    const { buildId, taskId } = await inProgressBuild();
+    const update = (input: Record<string, unknown>) => call("orchestrator", "ledger_update", { build_id: buildId, task_id: taskId, ...input });
+    // Duplicate URLs are dropped, within one call and across calls.
+    const { task: deduped } = await update({ links: [link(0), link(0), link(1)] });
+    expect(deduped.artifacts).toEqual([link(0), link(1)]);
+    await update({ links: [link(1), link(2)] });
+    expect((await task(buildId, taskId)).artifacts).toHaveLength(3);
+    for (let start = 3; start < 50; start += 20) {
+      await update({ links: Array.from({ length: Math.min(20, 50 - start) }, (_, i) => link(start + i)) });
+    }
+    expect((await task(buildId, taskId)).artifacts).toHaveLength(50);
+    await update({ links: [link(7)] }); // nothing new
+    const full = await expectError("orchestrator", "ledger_update", { build_id: buildId, task_id: taskId, links: [link(99)] }, "invalid_input");
+    expect(full).toContain("at most 50");
+
+    // The human (no write burst limit) fills the notes.
+    for (let i = 0; i < 50; i += 1) await call("human", "ledger_update", { build_id: buildId, task_id: taskId, note: `note ${i}` });
+    const notes = await expectError("orchestrator", "ledger_update", { build_id: buildId, task_id: taskId, note: "one more" }, "invalid_input");
+    expect(notes).toContain("50 notes");
+    await expectError("human", "ledger_update", { build_id: buildId, task_id: taskId, note: "x".repeat(2001) }, "invalid_input");
+  });
+
+  it("keeps the newest 50 artifacts when messages add more", async () => {
+    const { buildId, taskId } = await inProgressBuild();
+    for (let start = 0; start < 50; start += 20) {
+      await call("orchestrator", "ledger_update", {
+        build_id: buildId,
+        task_id: taskId,
+        links: Array.from({ length: Math.min(20, 50 - start) }, (_, i) => link(start + i)),
+      });
+    }
+    const { task: inReview } = await send("developer", { build_id: buildId, to_role: "cd", type: "review_request", task_id: taskId, links: [link(100)] });
+    expect(inReview.artifacts).toHaveLength(50);
+    expect(inReview.artifacts.at(-1)).toEqual(link(100));
+    expect(inReview.artifacts[0]).toEqual(link(1));
   });
 
   it("needs something to update and an existing task", async () => {

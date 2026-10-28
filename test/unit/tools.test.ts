@@ -1,5 +1,8 @@
+import { runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import {
+  buildSql,
+  buildStub,
   call,
   callRaw,
   createBuild,
@@ -7,6 +10,9 @@ import {
   expectError,
   inProgressBuild,
   ledger,
+  relaySql,
+  relayStub,
+  runAlarm,
   useCleanState,
   type Json,
   type Role,
@@ -62,10 +68,28 @@ describe("build_create", () => {
   });
 
   it("sends no kickoff when the orchestrator creates the build", async () => {
-    const build = await call("orchestrator", "build_create", { title: "Self-started", brief: "x", gates: { final_signoff: false } });
+    const build = await call("orchestrator", "build_create", { title: "Self-started", brief: "x", gates: { final_signoff: true } });
     expect(build.created_by).toBe("orchestrator");
-    expect(build.gates).toEqual({ plan_approval: true, final_signoff: false });
+    expect(build.gates).toEqual({ plan_approval: true, final_signoff: true });
     expect((await ledger(build.build_id)).messages).toEqual([]);
+  });
+
+  it("gives an orchestrator-created build both gates and caps no higher than the defaults", async () => {
+    for (const gates of [{ plan_approval: false }, { final_signoff: false }]) {
+      const message = await expectError("orchestrator", "build_create", { title: "x", brief: "y", gates }, "forbidden");
+      expect(message).toContain("only James may turn gates off");
+    }
+    for (const caps of [{ max_messages: 201 }, { max_review_rounds: 4 }]) {
+      const message = await expectError("orchestrator", "build_create", { title: "x", brief: "y", caps }, "forbidden");
+      expect(message).toContain("caps may only be lowered");
+    }
+    expect((await call("human", "build_list", { include_closed: true })).builds).toEqual([]);
+    const lowered = await call("orchestrator", "build_create", { title: "x", brief: "y", caps: { max_messages: 50, max_review_rounds: 3 } });
+    expect(lowered).toMatchObject({ gates: { plan_approval: true, final_signoff: true }, caps: { max_messages: 50, max_review_rounds: 3 } });
+    await call("human", "build_control", { build_id: lowered.build_id, action: "cancel" });
+    // The human may do either.
+    const open = await createBuild({ gates: { plan_approval: false, final_signoff: false }, caps: { max_messages: 1000, max_review_rounds: 10 } });
+    expect(open).toMatchObject({ gates: { plan_approval: false, final_signoff: false }, caps: { max_messages: 1000, max_review_rounds: 10 } });
   });
 
   it("is refused to other roles", async () => {
@@ -128,7 +152,8 @@ describe("build_list", () => {
         owners: [{ task_id: taskId, title: "Main screen", owner: "developer", status: "todo" }],
         pending_gates: [],
       });
-      expect(builds[0].last_message).toMatchObject({ id: "M1", from: "human", to: "orchestrator", type: "task" });
+      // The plan gate is off, so the last message is the relay's auto-approval notice.
+      expect(builds[0].last_message).toMatchObject({ id: "M2", from: "relay", to: "orchestrator", type: "status" });
     }
     await call("human", "build_control", { build_id: buildId, action: "cancel" });
     expect((await call("developer", "build_list")).builds).toEqual([]);
@@ -145,6 +170,55 @@ describe("build_list", () => {
     expect(builds[0].pending_gates).toEqual([expect.objectContaining({ id: "G1", kind: "plan_approval", status: "pending" })]);
     expect(builds[0].last_message).toMatchObject({ from: "relay", to: "human", type: "question" });
     expect(builds[0].last_message.excerpt.length).toBeLessThanOrEqual(140);
+  });
+
+  it("retries a failed summary push from the alarm, so a closed build never stays active in the registry", async () => {
+    const { buildId } = await inProgressBuild();
+    // RelayDO can't store summaries for a moment.
+    await relaySql("ALTER TABLE builds RENAME TO builds_away");
+    const before = Date.now();
+    await call("human", "build_control", { build_id: buildId, action: "cancel" });
+    await relaySql("ALTER TABLE builds_away RENAME TO builds");
+
+    const [{ summary_dirty }] = (await buildSql(buildId, "SELECT summary_dirty FROM local_state")) as Json[];
+    expect(summary_dirty).toBe(1);
+    const alarm = await runInDurableObject(buildStub(buildId), (_instance, state) => state.storage.getAlarm());
+    expect(alarm).toBeGreaterThan(before);
+    expect(alarm).toBeLessThanOrEqual(Date.now() + 60_000);
+    // Still "in_progress" in the registry, which blocks the one active-build slot.
+    await expectError("human", "build_create", { title: "Next", brief: "x" }, "conflict");
+
+    expect(await runAlarm(buildId)).toBe(true);
+    const [row] = (await relaySql("SELECT status FROM builds WHERE build_id = ?", buildId)) as Json[];
+    expect(row.status).toBe("cancelled");
+    expect(((await buildSql(buildId, "SELECT summary_dirty FROM local_state")) as Json[])[0].summary_dirty).toBe(0);
+    await createBuild({ title: "Next" });
+  });
+});
+
+describe("storage written by the previous version", () => {
+  it("is migrated when a Durable Object starts: new tables and columns are added, nothing is lost", async () => {
+    const { buildId, taskId } = await inProgressBuild();
+    await call("human", "build_control", { build_id: buildId, action: "halt" }); // something to keep
+    // Roll the build back to the v1 schema, then run the constructor's migration on the live instance.
+    await runInDurableObject(buildStub(buildId), (instance, state) => {
+      const sql = state.storage.sql;
+      sql.exec("DROP TABLE writes");
+      sql.exec("DROP TABLE local_state");
+      sql.exec("ALTER TABLE messages DROP COLUMN next_task_id");
+      (instance as unknown as { migrate(): void }).migrate();
+    });
+    await call("human", "build_control", { build_id: buildId, action: "resume" });
+    const { task } = await call("developer", "ledger_update", { build_id: buildId, task_id: taskId, status: "in_progress" });
+    expect(task).toMatchObject({ status: "in_progress", ready: true });
+    expect((await ledger(buildId)).messages[0]).toMatchObject({ id: "M1", next_task_id: null });
+
+    await runInDurableObject(relayStub(), (instance, state) => {
+      state.storage.sql.exec("ALTER TABLE wakes DROP COLUMN role");
+      (instance as unknown as { migrate(): void }).migrate();
+    });
+    const columns = (await relaySql("SELECT name FROM pragma_table_info('wakes')")) as Json[];
+    expect(columns.map((column) => column.name)).toContain("role");
   });
 });
 
@@ -205,13 +279,14 @@ describe("send", () => {
       links: [{ url: "https://figma.example.com/file/1" }],
     });
     expect(result.message).toMatchObject({
-      id: "M2",
-      seq: 2,
+      id: "M3",
+      seq: 3,
       build_id: buildId,
       from: "developer",
       to: "creative-director",
       type: "question",
       task_id: taskId,
+      next_task_id: null,
       body: "Which palette?",
       links: [{ url: "https://figma.example.com/file/1" }],
       verdict: null,
@@ -230,7 +305,7 @@ describe("send", () => {
       body: "Use the brand palette.",
       reply_to: result.message.id,
     });
-    expect(reply.message.reply_to).toBe("M2");
+    expect(reply.message.reply_to).toBe("M3");
     expect(reply.task).toBeUndefined();
   });
 

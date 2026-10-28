@@ -23,7 +23,10 @@ type SpikeRecord = {
 
 /** Records kept while the relay cannot be reached; the oldest go first past this. */
 const MAX_QUEUE = 500
-/** Individual records per event name per load; later occurrences are only counted (see the heartbeat). */
+/**
+ * Individual records per event name per load; later occurrences are only counted (see the heartbeat).
+ * Heartbeats and wake records are exempt: they are what an overnight run is read by.
+ */
 const MAX_RECORDS_PER_EVENT = 50
 /** POSTs per flush, so one flush never floods the relay. */
 const POSTS_PER_FLUSH = 20
@@ -52,16 +55,17 @@ export class Reporter {
   private failures = 0
   private retryAt = 0
   private isFlushing = false
+  private hasLastCallFailed = false
 
   constructor(config: RelayConfig) {
     this.config = config
   }
 
-  /** Counts one occurrence of `event` and queues a record of it, within the per-event cap. */
-  record(event: string, detail?: Detail, agentId?: string): void {
+  /** Counts one occurrence of `event` and queues a record of it, within the per-event cap unless `uncapped`. */
+  record(event: string, detail?: Detail, agentId?: string, options: { uncapped?: boolean } = {}): void {
     const count = (this.seen.get(event) ?? 0) + 1
     this.seen.set(event, count)
-    if (count > MAX_RECORDS_PER_EVENT) return
+    if (count > MAX_RECORDS_PER_EVENT && options.uncapped !== true) return
     this.queue.push({
       event,
       ts: new Date().toISOString(),
@@ -90,6 +94,8 @@ export class Reporter {
   /** Calls the relay and keeps the token state and last error up to date. */
   async call(host: Host, path: string, init?: { method?: 'GET' | 'POST'; body?: unknown }): Promise<RelayReply> {
     const reply = await relayRequest(host, this.config, path, init)
+    // A record the relay refused for itself says nothing about whether the relay answers.
+    this.hasLastCallFailed = !reply.ok && !isPermanent(reply.status)
     if (reply.ok) this.tokenState = 'accepted'
     else {
       if (reply.status === 401) this.tokenState = 'rejected'
@@ -137,6 +143,11 @@ export class Reporter {
 
   get queued(): number {
     return this.queue.length
+  }
+
+  /** The last request failed or timed out: at exit, a flush would only start one more that hangs the process. */
+  get isFailing(): boolean {
+    return this.hasLastCallFailed
   }
 }
 

@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { MESSAGE_TYPES, REQUESTABLE_GATES, TASK_STATUSES, VERDICTS } from "./model";
+import { ROLES } from "./roles";
 
 const BuildId = z
   .string()
@@ -59,6 +60,9 @@ export const schemas = {
     type: z.enum(MESSAGE_TYPES),
     body: Body,
     task_id: TaskId.optional().describe("Ledger task this message is about (required for work types)"),
+    next_task_id: TaskId.optional().describe(
+      "handoff only: task_id is your finished task (closed by this handoff) and to_role continues on this task",
+    ),
     links: Links.optional(),
     verdict: z.enum(VERDICTS).optional().describe("Required for type verdict"),
     changes: z
@@ -89,8 +93,8 @@ export const schemas = {
     reviewer: RoleName.nullable().optional().describe("Reviewing role; null clears it"),
     depends_on: z.array(TaskId).max(50).optional(),
     status: z.enum(TASK_STATUSES).optional(),
-    links: Links.optional().describe("Appended to the task's artifacts"),
-    note: z.string().min(1).max(5000).optional().describe("Appended to the task's notes"),
+    links: Links.optional().describe("Appended to the task's artifacts (deduplicated by URL; at most 50 per task)"),
+    note: z.string().min(1).max(2000).optional().describe("Appended to the task's notes (at most 50 per task)"),
   }),
 
   gate_request: z.object({
@@ -135,7 +139,8 @@ export const SpikeEventInput = z.object({
 export type SpikeEventInput = z.output<typeof SpikeEventInput>;
 
 export const WakeInput = z.object({
-  session_id: z.string().min(1).max(200).optional(),
+  role: z.enum(ROLES).describe("Only a poller with this role's token receives the wake"),
+  session_id: z.string().min(1).max(200).optional().describe("Omit for the first session of that role that polls"),
   text: z.string().min(1).max(5000),
 });
 export type WakeInput = z.output<typeof WakeInput>;

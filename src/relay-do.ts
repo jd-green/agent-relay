@@ -48,7 +48,13 @@ CREATE TABLE IF NOT EXISTS wakes (
   created_by TEXT NOT NULL,
   created_ms INTEGER NOT NULL,
   consumed_ms INTEGER,
-  consumed_by TEXT
+  consumed_by TEXT,
+  role TEXT
+);
+CREATE TABLE IF NOT EXISTS unread (
+  build_id TEXT NOT NULL,
+  role TEXT NOT NULL,
+  PRIMARY KEY (build_id, role)
 );
 `;
 
@@ -71,6 +77,7 @@ type SpikeEventRow = {
 
 type WakeRow = {
   id: number;
+  role: Role | null;
   session_id: string | null;
   text: string;
   created_by: Role;
@@ -93,6 +100,8 @@ export interface SpikeEvent {
 
 export interface Wake {
   id: string;
+  /** Only a poller with this role's token receives it. */
+  role: Role | null;
   session_id: string | null;
   text: string;
   created_by: Role;
@@ -129,6 +138,7 @@ function spikeEventOut(row: SpikeEventRow): SpikeEvent {
 function wakeOut(row: WakeRow): Wake {
   return {
     id: `W${row.id}`,
+    role: row.role,
     session_id: row.session_id,
     text: row.text,
     created_by: row.created_by,
@@ -151,6 +161,13 @@ export class RelayDO extends DurableObject<Env> {
     this.sql = ctx.storage.sql;
     this.config = loadConfig(env);
     this.sql.exec(SCHEMA);
+    this.migrate();
+  }
+
+  /** Brings storage written by an earlier version up to the current schema. */
+  private migrate(): void {
+    const columns = this.sql.exec<{ name: string }>("PRAGMA table_info(wakes)").toArray();
+    if (!columns.some((column) => column.name === "role")) this.sql.exec("ALTER TABLE wakes ADD COLUMN role TEXT");
   }
 
   // ---------------------------------------------------------------- kill switch
@@ -177,16 +194,17 @@ export class RelayDO extends DurableObject<Env> {
     );
     this.audit(actor, on ? "kill_switch.on" : "kill_switch.off", null, { reason: reason ?? null }, now);
     const halted = this.getKillSwitch();
-    if (wasOn && !on) {
-      // Let each active build restart its idle clocks and reschedule nudges.
-      await Promise.all(
-        this.activeBuildIds().map((id) =>
-          buildStub(this.env, id)
-            .killSwitchCleared()
-            .catch((err: unknown) => console.error(`kill switch notice to ${id} failed`, err)),
-        ),
-      );
-    }
+    // Each build checks its own copy inside every agent write, so the toggle is pushed to all of them before
+    // this answers: no agent write that passed the Worker's check before the toggle can land after it. A build
+    // whose push fails still has the Worker's check, and its alarm re-reads the switch.
+    const clearedBy = wasOn && !on ? actor : null;
+    await Promise.all(
+      this.activeBuildIds().map((id) =>
+        buildStub(this.env, id)
+          .setGlobalHalt(halted, clearedBy)
+          .catch((err: unknown) => console.error(`kill switch push to ${id} failed`, err)),
+      ),
+    );
     return halted;
   }
 
@@ -196,6 +214,7 @@ export class RelayDO extends DurableObject<Env> {
     // Reserve the registry row synchronously so concurrent creates see it in the active count.
     const reserved = capture(() =>
       this.ctx.storage.transactionSync(() => {
+        if (actor !== "human") this.checkAgentBuild(input);
         const active = this.activeBuildIds();
         if (active.length >= this.config.maxActiveBuilds) {
           const plural = this.config.maxActiveBuilds === 1 ? "" : "s";
@@ -222,7 +241,7 @@ export class RelayDO extends DurableObject<Env> {
 
     const release = () => this.sql.exec("DELETE FROM builds WHERE build_id = ?", id);
     const init = await buildStub(this.env, id)
-      .init({ ...input, build_id: id, created_by: actor })
+      .init({ ...input, build_id: id, created_by: actor, halted: this.getKillSwitch() })
       .catch((err: unknown) => {
         release();
         throw err;
@@ -235,8 +254,34 @@ export class RelayDO extends DurableObject<Env> {
     return { ok: true, result: init.result.build };
   }
 
-  /** Stores a build's summary unless a newer revision is already stored. */
-  putSummary(summary: BuildSummary): void {
+  /**
+   * An agent (the orchestrator) gets a build with both gates on and caps no higher than the configured
+   * defaults; only the human turns gates off or raises caps (DESIGN §10).
+   */
+  private checkAgentBuild(input: ToolInput<"build_create">): void {
+    const human = displayName("human", this.config);
+    const halted = this.getKillSwitch();
+    if (halted.global) {
+      fail("halted", `the global kill switch is on (${halted.reason ?? "no reason given"}); stop and wait for ${human}`);
+    }
+    if (input.gates?.plan_approval === false || input.gates?.final_signoff === false) {
+      fail("forbidden", `only ${human} may turn gates off; leave gates out (both stay on)`);
+    }
+    const { max_messages: messages, max_review_rounds: rounds } = input.caps ?? {};
+    if ((messages ?? 0) > this.config.maxMessagesPerBuild || (rounds ?? 0) > this.config.maxReviewRounds) {
+      fail(
+        "forbidden",
+        `caps may only be lowered (max_messages up to ${this.config.maxMessagesPerBuild}, max_review_rounds up to ` +
+          `${this.config.maxReviewRounds}); only ${human} may raise them`,
+      );
+    }
+  }
+
+  /**
+   * Stores a build's summary unless a newer revision is already stored, and which roles still have unread
+   * mail in it (BuildDO reports them once the build is closed; see inboxBuildIds).
+   */
+  putSummary(summary: BuildSummary, unreadBy: Role[] = []): void {
     this.sql.exec(
       "UPDATE builds SET status = ?, rev = ?, summary = ?, updated_ms = ? WHERE build_id = ? AND rev < ?",
       summary.status,
@@ -246,6 +291,12 @@ export class RelayDO extends DurableObject<Env> {
       summary.build_id,
       summary.rev,
     );
+    this.setUnread(summary.build_id, unreadBy);
+  }
+
+  setUnread(buildId: string, roles: Role[]): void {
+    this.sql.exec("DELETE FROM unread WHERE build_id = ?", buildId);
+    for (const role of roles) this.sql.exec("INSERT INTO unread (build_id, role) VALUES (?, ?)", buildId, role);
   }
 
   listBuilds(includeClosed: boolean): BuildSummary[] {
@@ -260,6 +311,19 @@ export class RelayDO extends DurableObject<Env> {
   activeBuildIds(): string[] {
     return this.sql
       .exec<{ build_id: string }>(`SELECT build_id FROM builds WHERE status NOT IN (${CLOSED_SQL}) ORDER BY created_ms`)
+      .toArray()
+      .map((row) => row.build_id);
+  }
+
+  /** What a build-less inbox reads for `role`: every active build plus closed ones where it still has unread mail. */
+  inboxBuildIds(role: Role): string[] {
+    return this.sql
+      .exec<{ build_id: string }>(
+        `SELECT build_id FROM builds
+         WHERE status NOT IN (${CLOSED_SQL}) OR build_id IN (SELECT build_id FROM unread WHERE role = ?)
+         ORDER BY created_ms`,
+        role,
+      )
       .toArray()
       .map((row) => row.build_id);
   }
@@ -304,7 +368,8 @@ export class RelayDO extends DurableObject<Env> {
   createWake(actor: Role, input: WakeInput): Wake {
     const row = this.sql
       .exec<WakeRow>(
-        "INSERT INTO wakes (session_id, text, created_by, created_ms) VALUES (?, ?, ?, ?) RETURNING *",
+        "INSERT INTO wakes (role, session_id, text, created_by, created_ms) VALUES (?, ?, ?, ?, ?) RETURNING *",
+        input.role,
         input.session_id ?? null,
         input.text,
         actor,
@@ -314,12 +379,16 @@ export class RelayDO extends DurableObject<Env> {
     return wakeOut(row);
   }
 
-  /** Returns and consumes pending wakes for this session plus untargeted ones (only untargeted without a session). */
+  /**
+   * Returns and consumes the caller role's pending wakes: those for this session plus untargeted ones (only
+   * untargeted ones without a session).
+   */
   consumeWakes(sessionId: string | null, role: Role): Wake[] {
     const now = Date.now();
     const rows = this.sql
       .exec<WakeRow>(
-        "SELECT * FROM wakes WHERE consumed_ms IS NULL AND (session_id IS NULL OR session_id = ?) ORDER BY id",
+        "SELECT * FROM wakes WHERE consumed_ms IS NULL AND role = ? AND (session_id IS NULL OR session_id = ?) ORDER BY id",
+        role,
         sessionId,
       )
       .toArray();

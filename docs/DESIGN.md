@@ -9,9 +9,9 @@ This is the implementation contract for the relay described in [`PRD.md`](PRD.md
 | Relay Worker | `src/**` (except `src/ui/`) , `wrangler.jsonc`, `vitest.config.ts`, `tsconfig.json`, `test/unit/**` | Cloudflare Worker + 2 Durable Object classes. Serves MCP, the JSON API, the spike endpoints and the ledger page. |
 | Ledger page | `src/ui/ledger.html` | One self-contained HTML file (inline CSS/JS, no external requests), imported by the Worker as text and served at `GET /`. |
 | Mods | `mods/relay-spike/`, `mods/relay-inbox/`, `.claude-plugin/marketplace.json` | Claude Code Mods (function-hook plugins). Spike Mod answers PRD milestone 1; inbox Mod is the wake path + inbox band. |
-| Protocol snippet | `protocol/PROTOCOL.md`, `protocol/roles/*.md` | The shared block pasted into every role Project's instructions, plus one short role addendum each. The Worker also serves this text as MCP `instructions` (imported as text). |
+| Protocol snippet | `protocol/PROTOCOL.md`, `protocol/roles/*.md`, `protocol/mcp/*.md` | The shared block pasted into every role Project's instructions, plus one short role addendum each. The Worker serves `protocol/mcp/<role>.md`, a role-first digest of at most 4,096 chars, as MCP `instructions` (imported as text). |
 | Docs | `docs/SETUP.md`, `docs/SPIKE.md`, `README.md` | Deploy, secrets, connectors, Mods, running the spike. |
-| Scripts | `scripts/**` | Dev-vars generation, secret upload via `op read`. |
+| Scripts | `scripts/**` | Dev-vars generation, secret upload via `op read`, and `role-session.sh`, the per-role Claude Code launcher for Plan B. |
 | E2E / live tests | `test/e2e/**`, `test/live/**` | Real HTTP against `wrangler dev`, official MCP SDK client, Playwright, live Claude agents. |
 
 ## 2. Roles and auth
@@ -47,7 +47,8 @@ Secrets: `ORCHESTRATOR_TOKEN`, `CREATIVE_DIRECTOR_TOKEN`, `DEVELOPER_TOKEN`, `HU
 ## 4. Storage layout
 
 - `RelayDO` — singleton, `idFromName("global")`. Holds: build registry (summary row per build), global kill switch, global audit (kill switch toggles, build creation), spike events and spike wake requests.
-- `BuildDO` — one per build, `idFromName(build_id)`. Holds that build's messages, tasks, verdicts, gates, notes, thread/presence rows, audit log, counters; owns the nudge alarm. All state transitions for a build happen inside one synchronous section of a `BuildDO` method (no `await` between read and write), so each tool call is atomic. After a change, `BuildDO` pushes its summary to `RelayDO`.
+- `BuildDO` — one per build, `idFromName(build_id)`. Holds that build's messages, tasks, verdicts, gates, notes, thread/presence rows, audit log, counters, a log of agent ledger writes (write burst limit and activity, §7–§8), its own copy of the global kill switch (§7) and the idle-build watch (§8); owns the nudge alarm. All state transitions for a build happen inside one synchronous section of a `BuildDO` method (no `await` between read and write), so each tool call is atomic. After a change, `BuildDO` pushes its summary to `RelayDO`; if that push fails, the build marks its summary dirty and its alarm retries the push within 60 s until it succeeds. Once a build is closed, the push also says which roles still have unread messages in it (for the build-less `inbox`, §10).
+- Storage written by an earlier version is migrated when the Durable Object starts (new tables and columns are added; nothing is dropped).
 - Both use SQLite-backed storage (`new_sqlite_classes`), which the Workers free plan supports.
 
 IDs: build `b-` + 10 random lowercase base32 chars; per build: tasks `T1, T2…`, gates `G1…`, verdicts `V1…`, messages `M1…` (integer `seq` per build, exposed as `id: "M<seq>"` and `seq`). Timestamps: ISO-8601 UTC strings in all outputs.
@@ -66,16 +67,18 @@ any non-terminal ──halt──▶ halted ──resume──▶ (status before
 any non-terminal ──cancel──▶ cancelled           (terminal: shipped, cancelled)
 ```
 
-- If the build's `gates.plan_approval` is `false`, `gate_request(plan_approval)` records the gate as auto-approved and goes straight to `in_progress`. Same for `final_signoff` → `shipped`.
+- If the build's `gates.plan_approval` is `false`, `gate_request(plan_approval)` records the gate as auto-approved (`decided_by: "relay"`, `auto: true`), goes straight to `in_progress` and sends the orchestrator the decision message the human would: relay `status` `Plan auto-approved (plan_approval gate is off). The build is in_progress: assign the first tasks.` Same for `final_signoff` → `shipped` with `Final sign-off auto-approved (final_signoff gate is off). The build is shipped.`
 - Work message types (`task`, `handoff`, `review_request`, `verdict`) from agent roles are accepted **only while the build is `in_progress`**. `question` and `status` are accepted in `planning`, `awaiting_*` and `in_progress`. Nothing from agent roles is accepted when `halted`, `shipped` or `cancelled` (error `halted` / `conflict`). The human may send any type in any non-terminal status.
 
 ### Task
 
-Fields: `id, title, description, assignee, owner, reviewer, status, round, max_rounds, artifacts[], notes[], depends_on[], last_activity_at, nudge_count, last_nudge_at, stalled, escalated, created_at, updated_at`.
+Fields: `id, title, description, assignee, owner, reviewer, status, round, max_rounds, artifacts[], notes[], depends_on[], ready, waiting_on[], last_activity_at, nudge_count, last_nudge_at, stalled, escalated, created_at, updated_at`.
 
 - `assignee` = the role doing the work. `owner` = whoever holds the ball now (what the ledger page shows as "current owner"; who gets nudged). `reviewer` = role that reviews (nullable).
-- `status`: `todo | in_progress | in_review | changes_requested | blocked | done | cancelled`.
+- `status`: `todo | in_progress | in_review | changes_requested | blocked | done | cancelled`. "Open" = not `done`/`cancelled`; "closed" = `done` or `cancelled`.
+- `ready` is true when every `depends_on` task is closed; `waiting_on` lists the `depends_on` tasks still open. Both are computed on output (`inbox` `my_tasks`, `ledger_get`, every task in a result). A task is owned by its assignee from creation, so a waiting task shows in its owner's `my_tasks`; only ready tasks are nudged (§8).
 - `max_rounds` starts at the build's `max_review_rounds` and grows when the human grants extra rounds.
+- Per task at most **50 artifacts** (deduplicated by URL) and **50 notes** (each ≤ 2,000 chars). `ledger_update` past either limit → `invalid_input`; links added by messages (`handoff`, `review_request`) are deduplicated and the task keeps the newest 50.
 
 ## 6. Messages
 
@@ -83,53 +86,83 @@ Shape (output):
 
 ```json
 { "id": "M7", "seq": 7, "build_id": "b-…", "from": "developer", "to": "creative-director",
-  "type": "review_request", "task_id": "T2", "body": "…", "links": [{"url": "https://…", "label": "Preview"}],
-  "verdict": null, "changes": null, "reply_to": null, "on_behalf_of": null, "created_at": "…", "read_at": null }
+  "type": "review_request", "task_id": "T2", "next_task_id": null, "body": "…",
+  "links": [{"url": "https://…", "label": "Preview"}], "verdict": null, "changes": null, "reply_to": null,
+  "on_behalf_of": null, "created_at": "…", "read_at": null }
 ```
 
-Input validation: `body` 1–20,000 chars; `links` ≤ 20 items, each `{url (http/https only, ≤ 2,000 chars), label? ≤ 200}`; `changes` 1–50 strings each ≤ 2,000 chars; `reply_to` an existing message id of this build.
+Input validation: `body` 1–20,000 chars; `links` ≤ 20 items, each `{url (http/https only, ≤ 2,000 chars), label? ≤ 200}`; `changes` 1–50 strings each ≤ 2,000 chars; `reply_to` an existing message id of this build; `next_task_id` on `handoff` only (`invalid_input` on any other type).
 
-Type rules and ledger side effects (applied atomically with the insert):
+Type rules and ledger side effects (applied atomically with the insert). "Elevated" = orchestrator or human.
 
 | Type | Required | Who may send | Effect |
 |---|---|---|---|
-| `task` | `task_id` (may be omitted only by `human`/`relay`, e.g. kickoff) | orchestrator, human | Assigns the task to `to`: `assignee = owner = to`, status `todo` unless already started. |
-| `handoff` | `task_id` | task `owner`, orchestrator, human | `assignee = owner = to`, status `todo`, `links` appended to `artifacts`. |
-| `review_request` | `task_id`, ≥ 1 link (preview URL) | task `owner`, orchestrator, human | Rejected if task is `blocked`/`done`/`cancelled`. `round += 1`, `reviewer = to`, `owner = to`, status `in_review`, links appended to artifacts. |
-| `verdict` | `task_id`, `verdict` ∈ `approved`/`changes_requested`; `changes` required for `changes_requested` | task `reviewer`, human | Task must be `in_review`. Inserts a verdict row (`round` = task round). `approved` → status `done`, `owner = null`. `changes_requested` → if `round >= max_rounds`: **escalate** (status `blocked`, `escalated = true`, `owner = human`, create `escalation` gate, relay messages to human and orchestrator); else status `changes_requested`, `owner = assignee`. |
+| `task` | `task_id` (may be omitted only by `human`/`relay`, e.g. kickoff) | orchestrator, human | Task must be open and (except for the human) not `in_review`. Assigns the task to `to`: `assignee = owner = to`, status `todo` if it was `blocked`, otherwise unchanged. |
+| `handoff` | `task_id` | task `owner`, orchestrator, human | Without `next_task_id`: task open and (except for the human) not `in_review`; `assignee = owner = to`, status `todo`, `links` appended to `artifacts`. |
+| `handoff` + `next_task_id` | `task_id` (the sender's finished task), `next_task_id` (another task) | `task_id`'s `owner`, its `assignee` once it is `done`, orchestrator, human | Hands the next role a different task. The `task_id` task: if it has no reviewer and `round = 0` it becomes `done` (`owner = null`); otherwise it must already be `done` (approved), else `conflict`; a `cancelled` one → `conflict`. The `next_task_id` task must be open, not `in_review` (except for the human) and not escalated: `assignee = owner = to`, status `todo`, its idle clock restarts. `links` are appended to both tasks. |
+| `review_request` | `task_id`, ≥ 1 link (preview URL) | task `owner`, orchestrator, human | Refused if the task is `blocked`/`done`/`cancelled` (`conflict`); if it is already `in_review` → `conflict` (`T2 is already in review with creative-director (round 1); wait for the verdict`), except from the human; if a reviewer is set and `to` is not it → `forbidden` (only the orchestrator or the human change reviewers, with `ledger_update`), except from the human; if `round + 1 > max_rounds` → `conflict` (`T2 has used all 3 review rounds`). Effect: `round += 1`, `reviewer = to` (when none was set, `to` becomes the reviewer), `owner = to`, status `in_review`, links appended to artifacts. |
+| `verdict` | `task_id`, `verdict` ∈ `approved`/`changes_requested`; `changes` required for `changes_requested` | task `reviewer`, human | Task must be `in_review`; `to` must be the task's `assignee` (`invalid_input` naming it), except from the human. Inserts a verdict row (`round` = task round). `approved` → status `done`, `owner = null`. `changes_requested` → if `round >= max_rounds`: **escalate** (below); else status `changes_requested`, `owner = assignee`. |
 | `question` | — | anyone | none |
 | `status` | — | anyone | none |
 
-- Every message whose sender is the referenced task's current `owner` counts as activity on that task (resets nudge state). Every ownership change also resets the nudge state for the new owner.
+- **Escalation** (review cap): status `blocked`, `escalated = true`, `owner = human`, an `escalation` gate (never a second pending one for the same task), and relay messages: a `question` to the human (`on_behalf_of: orchestrator`) with the latest changes list; a `status` to the orchestrator (`T2 "<title>" hit the review cap (3 rounds) and was escalated to James as G4.`); a `status` to the assignee (`T2 escalated to James after round 3; wait for his decision.`).
+- While a task's escalation gate is pending, no agent may send `task`, `handoff`, `review_request` or `verdict` on it or name it as `next_task_id` (`conflict`: `T2 is escalated to James as G4; wait for the decision`), and the orchestrator's `ledger_update` may only set it `cancelled` or add notes and links (§10). If the task is closed or leaves `blocked` by any route (orchestrator cancel, a human message or ledger override), the gate is marked `cancelled` (audit `gate.cancelled`), `escalated = false`, and an open task held by the human goes back to its assignee.
+- A message whose sender is the referenced task's current `owner` is activity on that task (resets its nudge state). Every ownership change also resets the nudge state for the new owner. Any `send` by an agent also answers the nudges about every task it owns (§8).
 - `to_role` accepts canonical ids and aliases; it may not be `relay`, and may not be the sender itself.
 - Messages are delivered to the recipient's inbox for that build. The first message to a role in a build creates that role's thread row (`thread_key = "<build_id>/<role>"`).
 
+### Orchestrator notices
+
+The relay keeps the orchestrator in the loop with `status` messages `from: "relay"` (`on_behalf_of: null`, `task_id` set when they are about a task). Like every relay message they never count toward the message cap or the burst limit.
+
+| When | To | Body |
+|---|---|---|
+| A task becomes `done` by anyone but the orchestrator | orchestrator | `T2 "Build" is done (approved by creative-director in round 1).` / `… (marked done by developer).` / `… (handed off by creative-director; developer continues on T3).` |
+| A task becomes `cancelled` by anyone but the orchestrator | orchestrator | `T2 "Build" was cancelled by human: <reason>.` (the `ledger_update` note; `… by human.` without one) |
+| A rejected escalation cancels the task | orchestrator | `T2 was cancelled; create a narrower replacement task if the work is still needed.` (after the human's decision message) |
+| A task's owner (not the orchestrator) sets it `blocked` | orchestrator | `T2 is blocked (developer): <note>.` |
+| One of the above closes the last open task of an `in_progress` build with no pending gate | orchestrator | the same message with ` Every task is closed: request final_signoff.` appended (one message, not two) |
+| `build_control resume` | orchestrator + the owner of every open task (not the human) | `Build resumed by James (was halted: <reason>). Carry on from the ledger.` |
+| `build_control cancel` | same | `Build cancelled by James: <reason>. Stop work on it.` (`Build cancelled by James. Stop work on it.` without a reason) |
+| `kill_switch {on: false}` (it was on) | same, in every build that is not closed or halted | `Relay kill switch cleared by James. Carry on from the ledger.` |
+| A gate is auto-approved (§5) | orchestrator | `Plan auto-approved …` / `Final sign-off auto-approved …` |
+
+A close also restarts the idle clock of every task whose last open dependency it was (§8). Halting a build sends no notice (agent writes answer `halted`).
+
 ## 7. Loop safety
 
-- **Message cap:** a `send` by an agent role that would exceed `max_messages` → rejected with `cap_reached`, build is halted (`halt_reason: "message cap reached"`), and the human gets a relay message. Human and relay messages don't count.
+- **Message cap:** a `send` by an agent role that would exceed `max_messages` → rejected with `cap_reached`, build is halted (`halt_reason: "message cap reached"`), and the human gets a relay message. Human and relay messages don't count; neither do `ledger_update` or `gate_request` calls.
 - **Burst limit:** more than `BURST_PER_MINUTE` messages from one sender in one build in 60 s → `rate_limited` (no halt).
+- **Write burst limit:** an agent role's `ledger_update` and `gate_request` calls share a second window: more than `BURST_PER_MINUTE × 3` of them in one build in 60 s → `rate_limited` (no halt). Refused calls change nothing and are not counted. The human is not limited.
+- **Per-task limits:** 50 artifacts and 50 notes per task (§5); `inbox` returns slim tasks (§10).
 - **Review cap:** `max_rounds` per task (section 6).
-- **Kill switch (global):** `kill_switch {on: true, reason}` (human only). While on, every write by an agent role (`send`, `ledger_update`, `gate_request`, `build_create`) fails with `halted`; `inbox` still answers and includes `halted: {global: true, reason}` so agents stop; nudges stop. `kill_switch {on: false}` clears it.
-- **Per-build halt:** `build_control {action: "halt" | "resume" | "cancel" | "set_caps"}` (human only).
+- **Kill switch (global):** `kill_switch {on: true, reason}` (human only). While on, every write by an agent role (`send`, `ledger_update`, `gate_request`, `build_create`) fails with `halted` (`the global kill switch is on (<reason>); stop and wait for James`); `inbox` still answers and includes `halted: {global: true, reason}` so agents stop; nudges stop. The switch lives in `RelayDO`; each toggle is pushed to every non-closed `BuildDO` (all awaited) before `kill_switch` answers, and each `BuildDO` checks its own copy synchronously inside every agent `send` / `ledger_update` / `gate_request`, so a write that passed the Worker's check just before the toggle is still refused. `RelayDO` checks it itself for agent `build_create`. The Worker-level check stays as a fast path; a build created while the switch is on starts with it on, and the alarm re-reads the switch in case a push was missed. `kill_switch {on: false}` clears it: idle clocks restart in `in_progress` builds (time under the switch is not idle time) and the lifecycle notice goes out (§6).
+- **Per-build halt:** `build_control {action: "halt" | "resume" | "cancel" | "set_caps"}` (human only). Resume and cancel send lifecycle notices (§6). Cancel also cancels every pending gate. Resume is refused (`conflict`) while the build's `message_count` is at its `max_messages` cap, since the next agent message would halt it again: raise the cap with `set_caps` first.
 
 ## 8. Nudges (BuildDO alarm)
 
-Applies only to tasks in builds with status `in_progress`, task status not `done`/`cancelled`, `owner` not null and not `human`, and only while the global kill switch is off.
+Nudges run only while the build is `in_progress` and the global kill switch is off.
 
-1. Idle ≥ `NUDGE_AFTER_MINUTES` since `last_activity_at` and `nudge_count = 0` → relay message (`from: "relay"`, `on_behalf_of: "orchestrator"`, type `status`) to the owner: `Nudge: T2 "<title>" has been idle for 30 min. …`; plus a copy to the orchestrator. `nudge_count = 1`, `last_nudge_at = now`.
-2. Still idle ≥ `NUDGE_AFTER_MINUTES` after `last_nudge_at` and `nudge_count = 1` → escalation: relay message to `human` and to `orchestrator` (`… missed two nudges`), `stalled = true`, `nudge_count = 2`. No further nudges until activity.
-3. Activity (section 6, or a `ledger_update` by the owner) resets `nudge_count = 0`, `stalled = false`, `last_activity_at = now`.
+**Watched tasks.** A task is watched when it is open, `ready` (every `depends_on` task closed), its `owner` is an agent role (not null, not `human`), and `nudge_count < 2`. A role's **activity** is its latest `send` or `ledger_update` anywhere in this build.
 
-The alarm is (re)scheduled after every state change to the earliest due time across tasks; `alarm()` processes everything due and reschedules.
+1. **Nudge:** the task has been idle ≥ `NUDGE_AFTER_MINUTES` since `last_activity_at` AND its owner has had no activity for ≥ `NUDGE_AFTER_MINUTES` → relay `status` (`on_behalf_of: "orchestrator"`) to the owner: `Nudge: T2 "<title>" has been idle for 30 min. You own it (status todo): post progress with send (type status), update it with ledger_update, or hand it off.`, plus a copy to the orchestrator (`Nudged developer: T2 "<title>" has been idle for 30 min.`) unless the owner is the orchestrator. `nudge_count = 1`, `last_nudge_at = now`. When one owner has several tasks due at once it gets **one** nudge listing them (`Nudge: you own 2 idle tasks: T1 "A" (todo, idle 31 min); T2 "B" (in_progress, idle 45 min). …`) and the orchestrator one copy (`Nudged developer about 2 idle tasks: …`); the message's `task_id` is the first listed task.
+2. **Second miss:** `nudge_count = 1` and still no activity by the owner ≥ `NUDGE_AFTER_MINUTES` after `last_nudge_at` → relay `status` to `human` (`on_behalf_of: "orchestrator"`) and to `orchestrator`: `Stalled: developer missed two nudges on T1 "A", T2 "B" (idle for 62 min).` (one message per owner), `stalled = true`, `nudge_count = 2`. No further nudges until activity.
+3. **Answer:** any `send` or `ledger_update` by the owner answers its nudges: `nudge_count = 0`, `last_nudge_at = null`, `stalled = false` on every task it owns. Activity on the task itself (section 6, or a `ledger_update` of it by the owner) and every ownership change also set `last_activity_at = now`.
+4. **Dependencies:** when a task's last open dependency closes, the dependent task's idle clock restarts (`last_activity_at = now`, nudge state reset).
+
+**Idle build (backstop for final sign-off).** An `in_progress` build with no open task and no pending gate is watched for the orchestrator the same way, from the moment it became idle (or the orchestrator's last activity, if later): after `NUDGE_AFTER_MINUTES` → relay `status` to the orchestrator `No open tasks for 30 min: request final_signoff or add tasks.`; after a second miss → `Stalled: orchestrator missed two nudges on "<title>": no open tasks for 60 min and final sign-off not requested.` to the human and the orchestrator. An orchestrator `send` or `ledger_update` answers it; adding a task, requesting a gate or leaving `in_progress` ends the watch. Audit rows target the build id.
+
+Entering `in_progress` (plan approval, a rejected sign-off, resume) and clearing the kill switch restart every idle clock. The alarm is (re)scheduled after every state change to the earliest due time (or within 60 s while a summary push needs retrying, §4); `alarm()` processes everything due and reschedules.
 
 ## 9. Secret scanning ("no secrets in message bodies")
 
-Every free-text input (`body`, `changes`, `links[].url/label`, task `title/description/notes`, gate `summary`, decision `note`) is scanned. A match fails the call with `secret_detected` naming the kind, never echoing the value. Kinds: Anthropic keys `sk-ant-…`; OpenAI-style `sk-[A-Za-z0-9_-]{32,}`; GitHub `gh[pousr]_…` / `github_pat_…`; AWS `AKIA[0-9A-Z]{16}`; Slack `xox[abprs]-…`; Google `AIza…`; Stripe `sk_live_` / `rk_live_`; PEM private-key headers; JWTs; any configured role token value. `op://…` references are allowed.
+Every free-text input (`body`, `changes`, `links[].url/label`, task `title/description/notes`, gate `summary`, decision `note`, `session_ref`, spike event fields, wake `text`) is scanned. A match fails the call with `secret_detected` naming the kind, never echoing the value. Kinds: Anthropic keys `sk-ant-…`; OpenAI-style `sk-…` (a known prefix such as `sk-proj-`, or a long token with at least one digit and one uppercase letter, so kebab-case identifiers don't match); GitHub `gh[pousr]_…` / `github_pat_…`; AWS `AKIA[0-9A-Z]{16}`; Slack `xox[abprs]-…`; Google `AIza…`; Stripe `sk_live_` / `rk_live_`; PEM private-key headers; JWTs; any configured role token value (checked on the raw text). Strict 1Password references are allowed: `op://<vault>/<item>/<field>[/<section>]` with `[A-Za-z0-9 ._-]` segments, ending at a word boundary; only matches wholly inside such a reference are skipped.
 
 ## 10. MCP server
 
-- Transport: Streamable HTTP, **stateless**, JSON responses only (no SSE). `POST /mcp` (Bearer) or `POST /mcp/<token>`. `GET`/`DELETE` → 405. JSON-RPC 2.0; a single message per POST (arrays accepted for older clients and answered with an array).
-- Methods: `initialize` (echo the client's `protocolVersion` if it is one of `2025-11-25`, `2025-06-18`, `2025-03-26`, `2024-11-05`, else answer `2025-06-18`; `capabilities: {tools: {listChanged: false}}`; `serverInfo: {name: "agent-relay", version}`; `instructions`: `protocol/PROTOCOL.md` + the caller's role addendum), `notifications/*` → HTTP 202 empty, `ping` → `{}`, `tools/list`, `tools/call`, `resources/list` / `prompts/list` → empty lists. Unknown method → `-32601`; parse error → `-32700`; invalid params → `-32602`.
+- Transport: Streamable HTTP, **stateless**, JSON responses only (no SSE). `POST /mcp` (Bearer) or `POST /mcp/<token>`. `GET`/`DELETE` → 405. JSON-RPC 2.0. A request with an `Origin` header whose origin is neither the request URL's nor `https://claude.ai` / `https://claude.com` → 403. `/mcp` responses carry no CORS headers. An `MCP-Protocol-Version` header that is present but not supported → 400 (absent → 2025-03-26 is assumed). Request ids must be strings or integers; a message with neither `method` nor `result`/`error`, a rejected notification, or a batch that is not allowed → `-32600` with HTTP 400. Batches are accepted only for protocol versions up to 2025-03-26, at most 20 messages, and answered with an array.
+- A 401 on `/mcp` carries `WWW-Authenticate: Bearer realm="agent-relay"`, plus `error="invalid_token", error_description="unknown or rotated relay token"` when a token was presented.
+- Methods: `initialize` (echo the client's `protocolVersion` if it is one of `2025-11-25`, `2025-06-18`, `2025-03-26`, `2024-11-05`, else answer `2025-06-18`; `capabilities: {tools: {listChanged: false}}`; `serverInfo: {name: "agent-relay", version}`; `instructions`: the caller's role digest `protocol/mcp/<role>.md`, at most 4,096 chars and starting with the role's name — the full protocol is the Project instructions text, not served over MCP), `notifications/*` → HTTP 202 empty, `ping` → `{}`, `tools/list`, `tools/call`, `resources/list` / `prompts/list` → empty lists. Unknown method → `-32601`; parse error → `-32700`; invalid params → `-32602`.
 - `tools/list` returns only the tools the caller's role may call, each with `inputSchema` (JSON Schema generated from the zod schema), `description` and `annotations` (`readOnlyHint` etc.).
 - `tools/call` result: `{content: [{type: "text", text: <JSON of result>}], structuredContent: <result>}`; tool-level failures → `{isError: true, content: [{type: "text", text: "<code>: <message>"}]}` (not a JSON-RPC error).
 
@@ -137,27 +170,28 @@ Every free-text input (`body`, `changes`, `links[].url/label`, task `title/descr
 
 | Tool | Roles | Input | Result |
 |---|---|---|---|
-| `whoami` | all | `{}` | `{role, display_name, roles: [{id, display_name, aliases}], halted, version}` |
-| `build_create` | orchestrator, human | `{title, brief, gates?: {plan_approval?: bool, final_signoff?: bool}, caps?: {max_messages?, max_review_rounds?}}` | the build. When the human creates it, the relay sends a kickoff `task` message (no task_id) to the orchestrator with the brief. |
-| `build_list` | all | `{include_closed?: bool}` | `{builds: [summary]}` — summary: `{build_id, title, status, owners: [{task_id, owner}], last_message: {id, from, to, type, excerpt, created_at} \| null, pending_gates, updated_at}` |
-| `send` | all | `{build_id, to_role, type, body, task_id?, links?, verdict?, changes?, reply_to?}` | `{message, task?}` |
-| `inbox` | all | `{build_id?, since?, peek?: bool, limit?: 1–100 (50), session_ref?}` | `{role, halted, builds: [{build_id, title, status, thread_key, messages: [...], unread_remaining, my_tasks: [...], pending_gates: [...], cursor}]}` — returns messages to the caller with `seq > since` if `since` given, else unread ones; marks returned messages read unless `peek`. `build_id` omitted → all non-closed builds (`since` then ignored). `session_ref` records which session/thread polled (presence). |
+| `whoami` | all | `{}` | `{role, display_name, roles: [{id, display_name, aliases, enabled}], halted, version}` |
+| `build_create` | orchestrator, human | `{title, brief, gates?: {plan_approval?: bool, final_signoff?: bool}, caps?: {max_messages?, max_review_rounds?}}` | the build. When the human creates it, the relay sends a kickoff `task` message (no task_id) to the orchestrator with the brief. Only the human may turn gates off or raise caps: from the orchestrator, a `false` gate or a cap above the configured default (`MAX_MESSAGES_PER_BUILD`, `MAX_REVIEW_ROUNDS`) → `forbidden`; lower caps are fine. |
+| `build_list` | all | `{include_closed?: bool}` | `{builds: [summary]}` — summary: `{build_id, title, status, halt_reason, owners: [{task_id, title, owner, status}], last_message: {id, from, to, type, excerpt, created_at} \| null, pending_gates, created_at, updated_at, rev}` |
+| `send` | all | `{build_id, to_role, type, body, task_id?, next_task_id?, links?, verdict?, changes?, reply_to?}` | `{message, task?, next_task?, gate?}` (`next_task` for a handoff with `next_task_id`; `gate` when the verdict escalated) |
+| `inbox` | all | `{build_id?, since?, peek?: bool, limit?: 1–100 (50), session_ref?}` | `{role, halted, builds: [{build_id, title, status, thread_key, messages: [...], unread_remaining, my_tasks: [...], pending_gates: [...], cursor}]}` — returns messages to the caller with `seq > since` if `since` given, else unread ones; marks returned messages read unless `peek`. `build_id` omitted → every non-closed build, plus every shipped/cancelled build in which the caller still has unread messages (so closing notices and the sign-off decision are delivered once); `since` is then ignored. `my_tasks`: the caller's open tasks (owner or assignee) with `ready`/`waiting_on`, slimmed to the last 5 artifacts and the last 3 notes (`ledger_get` keeps the full rows). `session_ref` records which session/thread polled (presence). |
 | `ledger_get` | all | `{build_id}` | `{build, tasks, gates, verdicts, messages (last 50, all roles), threads (presence), audit (last 50)}` |
-| `ledger_update` | all (rules below) | `{build_id, task_id?, title?, description?, assignee?, reviewer?, depends_on?, status?, links?, note?}` | `{task}`. No `task_id` → create (orchestrator/human only; build `planning` or `in_progress`; `title` + `assignee` required; `owner = assignee`). |
-| `gate_request` | orchestrator, human | `{build_id, kind: "plan_approval" \| "final_signoff", summary, links?}` | `{gate, build}`. plan_approval: build must be `planning` and have ≥ 1 task. final_signoff: build `in_progress`, every task `done`/`cancelled`, no pending gate. Sends a relay `question` to the human. |
-| `gate_decide` | human | `{build_id, gate_id, decision: "approved" \| "rejected", note?, extra_rounds?: 1–5 (1)}` | `{gate, build, task?}`. Effects per section 5; escalation approved → task `max_rounds += extra_rounds`, status `changes_requested`, `owner = assignee`, `escalated = false`; escalation rejected → task stays `blocked`, `owner = orchestrator`. Every decision sends a message from `human` to the orchestrator (and to the task's assignee for escalations). |
+| `ledger_update` | all (rules below) | `{build_id, task_id?, title?, description?, assignee?, reviewer?, depends_on?, status?, links?, note?}` | `{task}`. No `task_id` → create (orchestrator/human only; build `planning` or `in_progress`; `title` + `assignee` required; `owner = assignee`). `links` are appended to artifacts, `note` (≤ 2,000 chars) to notes, within the per-task limits (§5). |
+| `gate_request` | orchestrator, human | `{build_id, kind: "plan_approval" \| "final_signoff", summary, links?}` | `{gate, build}`. plan_approval: build must be `planning` and have ≥ 1 task. final_signoff: build `in_progress`, every task `done`/`cancelled`, no pending gate. Sends a relay `question` to the human, or is auto-approved when the gate is off (§5). |
+| `gate_decide` | human | `{build_id, gate_id, decision: "approved" \| "rejected", note?, extra_rounds?: 1–5 (1)}` | `{gate, build, task?}`. Effects per section 5; escalation approved → task `max_rounds += extra_rounds`, status `changes_requested`, `owner = assignee`, `escalated = false`; escalation rejected → task `cancelled`, `owner = null`, `escalated = false`, then the orchestrator notice (§6). Every decision sends a message from `human` to the orchestrator (and to the task's assignee for escalations). An escalation gate whose task is no longer escalated and `blocked` is marked `cancelled` instead, and the call answers `conflict`. |
 | `build_control` | human | `{build_id, action: "halt" \| "resume" \| "cancel" \| "set_caps", reason?, caps?: {max_messages?, max_review_rounds?}}` | `{build}` |
 | `kill_switch` | human | `{on: bool, reason?}` | `{halted: {global, reason, at}}` |
 
 `ledger_update` permissions:
-- orchestrator: any field; any status except `in_review`/`changes_requested` (those come only from messages); `done` on a task with a `reviewer` requires the latest verdict to be `approved`.
+- orchestrator: any field; any status except `in_review`/`changes_requested` (those come only from messages). `done` needs the task never to have been reviewed (`round = 0` and no reviewer), or an `approved` verdict for its current round with the task not `in_review`. `reviewer` can't change while the task is `in_review` or `changes_requested` (`conflict`). As the reviewer of a task in review it may not change its status (answer with a verdict). While the task's escalation gate is pending it may only set status `cancelled` and add `note`/`links` (`conflict` otherwise).
 - human: anything (override).
-- the task's current owner: `status` ∈ {`todo`, `in_progress`, `blocked`} (or `done` when the task has no reviewer), plus `links` (appended to artifacts) and `note`. Cannot change `assignee`/`reviewer` (use `handoff`).
+- the task's current owner: `status` ∈ {`todo`, `in_progress`, `blocked`} (or `done` when the task has no reviewer and was never reviewed, or its current round is approved), plus `links` and `note`. Cannot change `assignee`/`reviewer` (use `handoff`). While the task is `in_review` the owner is its reviewer, who may only add `note`/`links`: any `status` → `conflict` (`T2 is in review: answer it with a verdict`).
+- the task's assignee, when someone else holds it: `links` and `note` only, at any status (status and owner don't change).
 - anyone else: `forbidden`.
 
 ## 11. JSON API (same handlers as the tools)
 
-All under Bearer auth, CORS `*` (no cookies; `Authorization` + `Content-Type` allowed; preflight answered).
+All under Bearer auth. CORS `*` on `/api/*` and `/spike/*` (no cookies; `Authorization` + `Content-Type` allowed; preflight answered); none on `/mcp`.
 
 | Route | Maps to |
 |---|---|
@@ -170,32 +204,32 @@ All under Bearer auth, CORS `*` (no cookies; `Authorization` + `Content-Type` al
 | `POST /api/call/:tool` | any tool by name; body = tool input |
 | `POST /spike/events` | any role token. Body `{event, ts?, session_id?, surface?, agent_id?, detail?}` (detail JSON ≤ 4 KB). Stored in RelayDO (newest 5,000 kept). |
 | `GET /spike/events?since=&limit=` | human only. `{events: [...]}` newest first. |
-| `POST /spike/wake` | human only. `{session_id?: string (omit = any), text}` → `{wake: {id, …}}` |
-| `GET /spike/wake?session_id=` | any role token. Returns and consumes pending wake requests matching that session (or untargeted ones). |
-| `GET /spike` | no auth: small HTML viewer for spike events (asks for the human token like the ledger page) — optional, may reuse the ledger page with `#spike`. |
+| `POST /spike/wake` | human only. `{role: "orchestrator" \| "creative-director" \| "developer" \| "human", session_id?: string, text}` → `{wake: {id, role, session_id, text, created_by, created_at, consumed_at, consumed_by}}` |
+| `GET /spike/wake?session_id=` | any role token. Returns and consumes the pending wakes whose `role` is the caller's role and whose `session_id` is null or equals the given one (only untargeted ones when no `session_id` is given). |
+| `GET /spike` | no auth: redirects to the ledger page's spike view (`/#spike`). |
 
-Success: `200 {ok: true, result}`. Failure: `{ok: false, error: {code, message}}` with HTTP status per code.
+Success: `200 {ok: true, result}`. Failure: `{ok: false, error: {code, message}}` with HTTP status per code. Any method on an unknown path → 404 `not_found` (the message never echoes the path); 405 only for a known route with the wrong method.
 
 ## 12. Error codes
 
 | Code | HTTP | When |
 |---|---|---|
 | `unauthorized` | 401 | missing/unknown token |
-| `forbidden` | 403 | role not allowed for this tool/field/task |
-| `not_found` | 404 | build/task/gate/message not found |
-| `invalid_input` | 400 | schema violation, bad alias, self-send |
-| `conflict` | 409 | wrong state (e.g. verdict on a task not `in_review`, work message outside `in_progress`, active-build limit) |
-| `rate_limited` | 429 | burst limit |
+| `forbidden` | 403 | role not allowed for this tool/field/task (e.g. a review_request to someone other than the reviewer, an orchestrator build with a gate off) |
+| `not_found` | 404 | build/task/gate/message/route not found |
+| `invalid_input` | 400 | schema violation, bad alias, self-send, verdict not to the assignee, per-task limit reached |
+| `conflict` | 409 | wrong state (e.g. verdict on a task not `in_review`, a second review_request while in review, a task escalated to the human, work message outside `in_progress`, active-build limit) |
+| `rate_limited` | 429 | message burst limit or write burst limit |
 | `cap_reached` | 429 | message cap (build now halted) |
 | `halted` | 423 | global kill switch or build halted |
 | `secret_detected` | 400 | secret scanner hit |
 
 ## 13. Audit
 
-Every message, task change, gate request/decision, halt/resume/cancel, nudge, escalation and kill-switch toggle writes an audit row `{seq, at, actor (role | "relay"), action, target, detail}`. Build-scoped rows live in `BuildDO`; global rows (kill switch, build creation) in `RelayDO`.
+Every message, task change, gate request/decision/cancellation (`gate.cancelled` when an escalation gate is dropped), halt/resume/cancel, nudge (`nudge.sent`, `nudge.escalated`; the target is the task id, or the build id for the idle-build backstop), escalation and kill-switch toggle writes an audit row `{seq, at, actor (role | "relay"), action, target, detail}`. Build-scoped rows live in `BuildDO`; global rows (kill switch, build creation) in `RelayDO`. The write burst log (§7) is not part of the audit.
 
 ## 14. Wake path (what the relay offers)
 
 - Pull: the protocol tells every role to call `inbox` at the start of each turn (and the MCP `instructions` repeat it).
 - Poll for Mods / local drivers: `GET /api/inbox?peek=1` is cheap and side-effect free.
-- The inbox Mod (`mods/relay-inbox`) polls, shows an inbox band, injects unread messages into the next turn's context, and — when the session is idle and auto-wake is on — submits a prompt (`$.prompt.submit`) telling the role to check its inbox. In local Claude Code sessions this is PRD Plan B; whether it also works in Project threads is exactly what the spike Mod measures.
+- The inbox Mod (`mods/relay-inbox`) polls with `peek` (side-effect free) to drive its band, status line and wakes. When a prompt starts a turn it reads with `peek: false` and injects exactly the messages that read returned (nothing while halted), so nothing is marked read that the model wasn't given. When the session is idle and auto-wake is on, it submits a prompt (`$.prompt.submit`) telling the role to check its inbox. In local Claude Code sessions this is PRD Plan B; whether it also works in Project threads is exactly what the spike Mod measures.

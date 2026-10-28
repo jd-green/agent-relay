@@ -70,6 +70,8 @@ export interface Message {
   to: Role;
   type: MessageType;
   task_id: string | null;
+  /** handoff only: the task the recipient continues on (task_id is then the sender's finished task). */
+  next_task_id: string | null;
   body: string;
   links: Link[];
   verdict: VerdictValue | null;
@@ -93,6 +95,10 @@ export interface Task {
   artifacts: Link[];
   notes: Note[];
   depends_on: string[];
+  /** Every depends_on task is done or cancelled. */
+  ready: boolean;
+  /** The depends_on tasks still open. */
+  waiting_on: string[];
   last_activity_at: string;
   nudge_count: number;
   last_nudge_at: string | null;
@@ -183,6 +189,7 @@ export interface InboxBuild {
   thread_key: string;
   messages: Message[];
   unread_remaining: number;
+  /** Open tasks the caller owns or is assigned, slimmed to the last 5 artifacts and the last 3 notes. */
   my_tasks: Task[];
   pending_gates: Gate[];
   cursor: number;
