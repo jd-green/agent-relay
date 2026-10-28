@@ -253,6 +253,62 @@ async function hangingServer() {
   };
 }
 
+/**
+ * A relay in front of the real one that answers some requests late: the request reaches the relay at
+ * once (a read marks mail read, a wake poll consumes its wakes), and only the answer is held back.
+ * `slow(method, path, body)` returns how many ms to hold the answer of that request.
+ */
+async function slowProxy(target, slow) {
+  const sockets = new Set();
+  const held = [];
+  const server = createServer(async (req, res) => {
+    res.on("error", () => {});
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    const body = Buffer.concat(chunks).toString("utf8");
+    const headers = { ...req.headers };
+    delete headers.host;
+    delete headers["content-length"];
+    try {
+      const upstream = await fetch(`${target}${req.url}`, { method: req.method, headers, body: ["GET", "HEAD"].includes(req.method) ? undefined : body });
+      const text = await upstream.text();
+      const ms = slow(req.method, req.url.split("?")[0], body);
+      if (ms > 0) {
+        held.push({ method: req.method, path: req.url, ms });
+        await sleep(ms);
+      }
+      res.writeHead(upstream.status, { "content-type": upstream.headers.get("content-type") ?? "application/json" });
+      res.end(text);
+    } catch (error) {
+      res.writeHead(502, { "content-type": "application/json" });
+      res.end(JSON.stringify({ ok: false, error: { code: "bad_gateway", message: String(error) } }));
+    }
+  });
+  server.on("connection", (s) => {
+    sockets.add(s);
+    s.on("close", () => sockets.delete(s));
+  });
+  await new Promise((r) => server.listen(0, "127.0.0.1", r));
+  return {
+    url: `http://127.0.0.1:${server.address().port}`,
+    held,
+    close: () => {
+      for (const s of sockets) s.destroy();
+      return new Promise((r) => server.close(r));
+    },
+  };
+}
+
+/** Holds the answer of every inbox read that marks mail read (`POST /api/call/inbox` with `peek: false`) for `ms`. */
+const slowReads = (ms) => (method, path, body) => {
+  if (method !== "POST" || path !== "/api/call/inbox") return 0;
+  try {
+    return JSON.parse(body).peek === false ? ms : 0;
+  } catch {
+    return 0;
+  }
+};
+
 // =========================================================================== relay-spike
 
 describe("relay-spike Mod against a live relay", { skip: SKIP }, () => {
@@ -350,6 +406,28 @@ describe("relay-spike Mod against a live relay", { skip: SKIP }, () => {
     }
     const names = (await spikeEventsAfterEnd(relay, session.sessionId)).map((e) => e.event);
     assert.ok(names.includes("wake.submitted") && names.includes("wake.turn_started"), names.join(", "));
+  });
+
+  test("a wake poll the relay answers slowly (5 s, past the 3 s other requests wait) still starts a turn", { timeout: 180_000 }, async (t) => {
+    const word = nonce("SLOWWAKE");
+    const proxy = await slowProxy(relay.url, (method, path) => (method === "GET" && path === "/spike/wake" ? 5_000 : 0));
+    const session = claude({ stdin: true, plugins: { "relay-spike": spikeOptions(relay, "developer", { relay_url: proxy.url }) } });
+    try {
+      session.send("Reply with exactly READY and nothing else.");
+      assert.ok(await session.until((r) => r.results.length >= 1, 90_000), explain(session));
+      await ok(asHuman(relay, "/spike/wake", { method: "POST", body: JSON.stringify({ role: "developer", session_id: session.sessionId, text: `Spike wake: reply with exactly ${word} and nothing else.` }) }));
+      assert.ok(await session.until((r) => r.results.length >= 2, 60_000), `no turn started by itself\n${explain(session)}`);
+      assert.match(session.results[1].result, new RegExp(word));
+    } finally {
+      session.end();
+      await session.exited;
+      await proxy.close();
+    }
+    const events = await spikeEventsAfterEnd(relay, session.sessionId);
+    const wakes = events.filter((e) => e.event.startsWith("wake.")).map((e) => e.event);
+    t.diagnostic(`wake records: ${wakes.join(", ")} · answers held: ${proxy.held.length}`);
+    assert.ok(proxy.held.length >= 2, "the wake polls went through the slow proxy");
+    assert.deepEqual(wakes, ["wake.submitted", "wake.turn_started"], "submitted from the slow answer itself, not given up on");
   });
 
   test("a wake that arrives while a turn runs is deferred, then submitted once the turn is over", { timeout: 180_000 }, async (t) => {
@@ -587,6 +665,55 @@ describe("relay-inbox Mod against a live relay", { skip: SKIP }, () => {
     assert.ok((await message(a.id)).read_at && (await message(b.id)).read_at, "both handed over, both read");
   });
 
+  test("a read that answers after the prompt's 1.5 s: the prompt carries a recovery cursor, and inbox {since} lists the message again", { timeout: 180_000 }, async (t) => {
+    await drain();
+    const word = nonce("RECOVER");
+    const sent = await tell(`Recovery check: the codeword is ${word}.`);
+    // The read marks the message read at once; its answer reaches the Mod only after 20 s, long after the prompt went.
+    const proxy = await slowProxy(relay.url, slowReads(20_000));
+    let run;
+    try {
+      run = await claude({
+        plugins: { "relay-inbox": inboxOptions(relay, "developer", { relay_url: proxy.url, auto_wake: false }) },
+        mcp: { relay, role: "developer" },
+        maxTurns: 5,
+        prompt: "What codeword did the orchestrator send you over the relay? Check your context, and use the relay tools as it says. Reply as CODEWORD=<codeword> or CODEWORD=none.",
+      }).exited;
+    } finally {
+      await proxy.close();
+    }
+    assert.equal(run.code, 0, explain(run));
+    const since = sent.seq - 1;
+    const calls = run.tools().filter((c) => c.name === "mcp__relay__inbox").map((c) => c.input);
+    t.diagnostic(`held answers: ${JSON.stringify(proxy.held)} · inbox calls: ${JSON.stringify(calls)} · answer: ${run.text()}`);
+    assert.ok(proxy.held.length >= 1, "the Mod's read went through the slow proxy");
+    assert.ok((await message(sent.id)).read_at, "the read marked the message read on the relay");
+    assert.ok(calls.some((input) => input.build_id === buildId && input.since === since), `the model did not call inbox {build_id: ${buildId}, since: ${since}}\n${explain(run)}`);
+    assert.match(run.text(), new RegExp(`CODEWORD=${word}`), explain(run));
+  });
+
+  test("a late read's messages, added as a row after the turn ended, wake the idle session and reach the model", { timeout: 240_000 }, async (t) => {
+    await drain();
+    const word = nonce("ROWWAKE");
+    await tell(`Row check: reply with exactly ${word} and nothing else.`);
+    // The prompt goes without the message at 1.5 s; its read's answer comes 8 s later, after that turn's only request.
+    const proxy = await slowProxy(relay.url, slowReads(8_000));
+    const session = claude({ stdin: true, plugins: { "relay-inbox": inboxOptions(relay, "developer", { relay_url: proxy.url }) }, maxTurns: 3 });
+    try {
+      assert.ok(await session.until((r) => r.statusTexts("relay-inbox").some((s) => /1 unread/.test(s)), 30_000), explain(session));
+      session.send("Reply with exactly READY and nothing else. Do not use tools this turn.");
+      assert.ok(await session.until((r) => r.results.length >= 1, 90_000), explain(session));
+      assert.ok(await session.until((r) => r.results.length >= 2, 60_000), `no wake turn after the late row\n${explain(session)}`);
+    } finally {
+      session.end();
+      await session.exited;
+      await proxy.close();
+    }
+    t.diagnostic(`results: ${JSON.stringify(session.results.map((r) => r.result))} · held answers: ${proxy.held.length}`);
+    assert.doesNotMatch(session.results[0].result, new RegExp(word), "the first turn did not have the message");
+    assert.match(session.results[1].result, new RegExp(word), `the wake turn did not read the row\n${explain(session)}`);
+  });
+
   test("while the kill switch is on, a prompt carries no relay messages and they are still unread once it is cleared", { timeout: 180_000 }, async (t) => {
     await drain();
     const word = nonce("HALTED");
@@ -608,6 +735,40 @@ describe("relay-inbox Mod against a live relay", { skip: SKIP }, () => {
     assert.equal((await message(sent.id)).read_at, null, `${sent.id} was marked read during the halt`);
     const unread = (await ok(relay.call("developer", "inbox", { build_id: buildId, peek: true }))).builds[0].messages.map((m) => m.id);
     assert.ok(unread.includes(sent.id), `${sent.id} is gone from the inbox after the halt`);
+  });
+});
+
+// =========================================================================== relay-inbox and finishing handoffs
+
+describe("relay-inbox and a finishing handoff", { skip: SKIP }, () => {
+  let relay;
+  before(async () => {
+    relay = await startRelay();
+  });
+  after(async () => {
+    await relay?.stop();
+  });
+
+  test("a finishing handoff: the injected header names the task the recipient now continues on (next_task_id)", { timeout: 180_000 }, async (t) => {
+    const build = await ok(relay.call("human", "build_create", { title: "Handoff check", brief: "x", gates: { plan_approval: false, final_signoff: false } }));
+    const id = build.build_id;
+    const design = (await ok(relay.call("orchestrator", "ledger_update", { build_id: id, title: "Design the screen", assignee: "creative-director" }))).task;
+    // A task in between, so the next task is not simply the one after the finished one.
+    await ok(relay.call("orchestrator", "ledger_update", { build_id: id, title: "Write the copy", assignee: "creative-director" }));
+    const buildTask = (await ok(relay.call("orchestrator", "ledger_update", { build_id: id, title: "Build the screen", assignee: "developer", depends_on: [design.id] }))).task;
+    await ok(relay.call("orchestrator", "gate_request", { build_id: id, kind: "plan_approval", summary: "Design, then build." }));
+    await ok(relay.call("developer", "inbox", { peek: false, limit: 100 }));
+    const handoff = (await ok(relay.call("creative-director", "send", { build_id: id, to_role: "developer", type: "handoff", task_id: design.id, next_task_id: buildTask.id, body: "The design is finished; the spec is linked.", links: [{ url: "https://example.com/spec", label: "Spec" }] }))).message;
+    assert.equal(handoff.next_task_id, buildTask.id, "the relay keeps next_task_id on the message");
+    const run = await claude({
+      plugins: { "relay-inbox": inboxOptions(relay, "developer", { auto_wake: false }) },
+      prompt: "An Agent Relay handoff is in your context. Reply on one line, exactly: FINISHED=<the task id it hands off as finished> NEXT=<the task id you now continue on>. Do not use tools.",
+    }).exited;
+    assert.equal(run.code, 0, explain(run));
+    t.diagnostic(`tasks ${design.id} → ${buildTask.id} · answer: ${run.text()}`);
+    assert.match(run.text(), new RegExp(`NEXT=${buildTask.id}\\b`), explain(run));
+    assert.match(run.text(), new RegExp(`FINISHED=${design.id}\\b`), explain(run));
+    assert.ok((await ok(relay.call("human", "ledger_get", { build_id: id }))).messages.find((m) => m.id === handoff.id).read_at, "handed over, so read");
   });
 });
 
@@ -647,5 +808,38 @@ describe("relay-inbox /relay-reply to a nudge", { skip: SKIP }, () => {
     assert.equal(stalled, undefined, `escalated to the human although the owner replied: ${stalled?.body}`);
     assert.equal(row.stalled, false);
     assert.ok(row.nudge_count <= 1, `the reply did not reset the nudges: nudge_count ${row.nudge_count}`);
+  });
+});
+
+// =========================================================================== relay-inbox and the orchestrator's own nudge
+
+describe("relay-inbox /relay-reply in the orchestrator's session", { skip: SKIP }, () => {
+  let relay;
+  before(async () => {
+    // 30 s: the nudge is the orchestrator's newest message for 30 s, until the second-miss notice follows it.
+    relay = await startRelay({ vars: { NUDGE_AFTER_MINUTES: "0.5" } });
+  });
+  after(async () => {
+    await relay?.stop();
+  });
+
+  test("a nudge the relay sent on behalf of the orchestrator about its own task: nothing is sent, and it says to answer with ledger_update", { timeout: 180_000 }, async (t) => {
+    const build = await ok(relay.call("human", "build_create", { title: "Own nudge", brief: "x", gates: { plan_approval: false, final_signoff: false } }));
+    const id = build.build_id;
+    const task = (await ok(relay.call("orchestrator", "ledger_update", { build_id: id, title: "Re-plan the screens", assignee: "orchestrator" }))).task;
+    await ok(relay.call("orchestrator", "gate_request", { build_id: id, kind: "plan_approval", summary: "One task, mine." }));
+    const nudge = await waitFor(async () => {
+      const box = await ok(relay.call("orchestrator", "inbox", { build_id: id, peek: true }));
+      return box.builds[0].messages.find((m) => m.from === "relay" && m.task_id === task.id && m.on_behalf_of === "orchestrator");
+    }, 90_000, 1_000);
+    assert.ok(nudge, "no nudge to the orchestrator about its own task");
+
+    const run = await claude({ plugins: { "relay-inbox": inboxOptions(relay, "orchestrator", { auto_wake: false }) }, prompt: `/relay-reply Re-planning ${task.id} now.` }).exited;
+    assert.equal(run.code, 0, explain(run));
+    t.diagnostic(`nudge ${nudge.id} to ${nudge.to} for ${nudge.on_behalf_of} · answer: ${run.text()}`);
+    assert.ok(run.text().includes(`${nudge.id} is a relay nudge sent on behalf of you (orchestrator) about ${task.id}: a reply would go to yourself, so nothing was sent.`), explain(run));
+    assert.ok(run.text().includes(`Answer it with ledger_update {build_id: "${id}", task_id: "${task.id}", note: "<what you are doing>"} instead.`), explain(run));
+    const ledger = await ok(relay.call("human", "ledger_get", { build_id: id }));
+    assert.deepEqual(ledger.messages.filter((m) => m.from === "orchestrator" && m.type === "status"), [], "the Mod sent nothing");
   });
 });

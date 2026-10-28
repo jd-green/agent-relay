@@ -1,7 +1,16 @@
 import { DurableObject } from "cloudflare:workers";
 import { loadConfig, type Config } from "./config";
 import { capture, fail, type Outcome } from "./errors";
-import { CLOSED_BUILD_STATUSES, iso, isoOrNull, type AuditDetail, type Build, type BuildSummary, type Halted } from "./model";
+import {
+  CLOSED_BUILD_STATUSES,
+  iso,
+  isoOrNull,
+  type AuditDetail,
+  type Build,
+  type BuildSummary,
+  type Halted,
+  type KillState,
+} from "./model";
 import { displayName, type Role } from "./roles";
 import type { SpikeEventInput, ToolInput, WakeInput } from "./schemas";
 import { buildStub } from "./stubs";
@@ -13,14 +22,17 @@ CREATE TABLE IF NOT EXISTS builds (
   rev INTEGER NOT NULL,
   summary TEXT,
   created_ms INTEGER NOT NULL,
-  updated_ms INTEGER NOT NULL
+  updated_ms INTEGER NOT NULL,
+  kill_epoch INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS kill_switch (
   id INTEGER PRIMARY KEY CHECK (id = 1),
   active INTEGER NOT NULL,
   reason TEXT,
   at_ms INTEGER NOT NULL,
-  by_role TEXT NOT NULL
+  by_role TEXT NOT NULL,
+  epoch INTEGER NOT NULL DEFAULT 0,
+  cleared INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS audit (
   seq INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -60,6 +72,8 @@ CREATE TABLE IF NOT EXISTS unread (
 
 /** Spike events kept (newest first); older ones are trimmed on insert. */
 export const SPIKE_EVENTS_KEPT = 5000;
+/** How soon the alarm pushes the kill switch again to a build that did not acknowledge it (DESIGN §7). */
+export const KILL_RETRY_MS = 30_000;
 const CLOSED_SQL = CLOSED_BUILD_STATUSES.map((status) => `'${status}'`).join(", ");
 const BUILD_ID_ALPHABET = "abcdefghijklmnopqrstuvwxyz234567";
 
@@ -166,46 +180,107 @@ export class RelayDO extends DurableObject<Env> {
 
   /** Brings storage written by an earlier version up to the current schema. */
   private migrate(): void {
-    const columns = this.sql.exec<{ name: string }>("PRAGMA table_info(wakes)").toArray();
-    if (!columns.some((column) => column.name === "role")) this.sql.exec("ALTER TABLE wakes ADD COLUMN role TEXT");
+    this.addColumn("wakes", "role", "TEXT");
+    this.addColumn("kill_switch", "epoch", "INTEGER NOT NULL DEFAULT 0");
+    this.addColumn("kill_switch", "cleared", "INTEGER NOT NULL DEFAULT 0");
+    this.addColumn("builds", "kill_epoch", "INTEGER NOT NULL DEFAULT 0");
+  }
+
+  private addColumn(table: string, column: string, type: string): void {
+    const columns = this.sql.exec<{ name: string }>(`PRAGMA table_info(${table})`).toArray();
+    if (!columns.some((row) => row.name === column)) this.sql.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`);
   }
 
   // ---------------------------------------------------------------- kill switch
 
   getKillSwitch(): Halted {
+    return this.killState().halted;
+  }
+
+  /** The switch with its epoch (incremented on every toggle), which the Worker passes into build writes. */
+  killState(): KillState {
     const row = this.sql
-      .exec<{ active: number; reason: string | null; at_ms: number }>("SELECT active, reason, at_ms FROM kill_switch")
+      .exec<{ active: number; reason: string | null; at_ms: number; by_role: Role; epoch: number; cleared: number }>(
+        "SELECT active, reason, at_ms, by_role, epoch, cleared FROM kill_switch",
+      )
       .toArray()[0];
-    return { global: row?.active === 1, reason: row?.reason ?? null, at: row ? iso(row.at_ms) : null };
+    return {
+      halted: { global: row?.active === 1, reason: row?.reason ?? null, at: row ? iso(row.at_ms) : null },
+      epoch: row?.epoch ?? 0,
+      by: row?.by_role ?? null,
+      cleared: row?.cleared === 1,
+    };
   }
 
   async setKillSwitch(actor: Role, on: boolean, reason?: string): Promise<Halted> {
     const now = Date.now();
-    const wasOn = this.getKillSwitch().global;
+    const previous = this.killState();
     const storedReason = on ? (reason ?? `kill switch turned on by ${displayName(actor, this.config)}`) : null;
+    const epoch = previous.epoch + 1;
     this.sql.exec(
-      `INSERT INTO kill_switch (id, active, reason, at_ms, by_role) VALUES (1, ?, ?, ?, ?)
-       ON CONFLICT (id) DO UPDATE SET active = excluded.active, reason = excluded.reason,
-         at_ms = excluded.at_ms, by_role = excluded.by_role`,
+      `INSERT INTO kill_switch (id, active, reason, at_ms, by_role, epoch, cleared) VALUES (1, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT (id) DO UPDATE SET active = excluded.active, reason = excluded.reason, at_ms = excluded.at_ms,
+         by_role = excluded.by_role, epoch = excluded.epoch, cleared = excluded.cleared`,
       on ? 1 : 0,
       storedReason,
       now,
       actor,
+      epoch,
+      previous.halted.global && !on ? 1 : 0,
     );
-    this.audit(actor, on ? "kill_switch.on" : "kill_switch.off", null, { reason: reason ?? null }, now);
-    const halted = this.getKillSwitch();
+    this.audit(actor, on ? "kill_switch.on" : "kill_switch.off", null, { reason: reason ?? null, epoch }, now);
     // Each build checks its own copy inside every agent write, so the toggle is pushed to all of them before
     // this answers: no agent write that passed the Worker's check before the toggle can land after it. A build
-    // whose push fails still has the Worker's check, and its alarm re-reads the switch.
-    const clearedBy = wasOn && !on ? actor : null;
-    await Promise.all(
-      this.activeBuildIds().map((id) =>
-        buildStub(this.env, id)
-          .setGlobalHalt(halted, clearedBy)
-          .catch((err: unknown) => console.error(`kill switch push to ${id} failed`, err)),
-      ),
+    // whose push fails still gets the state with the next write through the Worker, and the alarm pushes it
+    // again until every non-closed build has acknowledged this epoch.
+    const state = this.killState();
+    await this.pushKillState(state);
+    return state.halted;
+  }
+
+  /** Retries kill switch pushes that failed (DESIGN §7). */
+  override async alarm(): Promise<void> {
+    await this.pushKillState(this.killState());
+  }
+
+  /** Pushes the switch to every non-closed build that hasn't acknowledged its epoch; failures re-arm the alarm. */
+  private async pushKillState(state: KillState): Promise<void> {
+    const ids = this.unacknowledged(state.epoch);
+    const results = await Promise.all(
+      ids.map(async (id) => {
+        try {
+          const epoch = await this.pushKill(id, state);
+          this.sql.exec("UPDATE builds SET kill_epoch = MAX(kill_epoch, ?) WHERE build_id = ?", epoch, id);
+          return epoch >= state.epoch;
+        } catch (err) {
+          console.error(`kill switch push to ${id} failed; the alarm retries it`, err);
+          return false;
+        }
+      }),
     );
-    return halted;
+    if (results.some((acknowledged) => !acknowledged)) await this.retryKillPush();
+  }
+
+  /** One push to one build; resolves to the epoch the build now holds. */
+  protected pushKill(id: string, state: KillState): Promise<number> {
+    return buildStub(this.env, id).setGlobalHalt(state);
+  }
+
+  /** Non-closed builds whose acknowledged kill switch epoch is older than `epoch`. */
+  private unacknowledged(epoch: number): string[] {
+    return this.sql
+      .exec<{ build_id: string }>(
+        `SELECT build_id FROM builds WHERE status NOT IN (${CLOSED_SQL}) AND kill_epoch < ? ORDER BY created_ms`,
+        epoch,
+      )
+      .toArray()
+      .map((row) => row.build_id);
+  }
+
+  private async retryKillPush(): Promise<void> {
+    const at = Date.now() + KILL_RETRY_MS;
+    const current = await this.ctx.storage.getAlarm();
+    if (current === null || current > at) await this.ctx.storage.setAlarm(at);
   }
 
   // ---------------------------------------------------------------- builds
@@ -241,7 +316,7 @@ export class RelayDO extends DurableObject<Env> {
 
     const release = () => this.sql.exec("DELETE FROM builds WHERE build_id = ?", id);
     const init = await buildStub(this.env, id)
-      .init({ ...input, build_id: id, created_by: actor, halted: this.getKillSwitch() })
+      .init({ ...input, build_id: id, created_by: actor, kill: this.killState() })
       .catch((err: unknown) => {
         release();
         throw err;
@@ -251,6 +326,9 @@ export class RelayDO extends DurableObject<Env> {
       return init;
     }
     this.putSummary(init.result.summary);
+    // A toggle while init was in flight is retried from the alarm unless the build already holds it.
+    this.sql.exec("UPDATE builds SET kill_epoch = MAX(kill_epoch, ?) WHERE build_id = ?", init.result.epoch, id);
+    if (init.result.epoch < this.killState().epoch) await this.retryKillPush();
     return { ok: true, result: init.result.build };
   }
 

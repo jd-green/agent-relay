@@ -44,6 +44,9 @@ Tests:
 | `npm test` | Unit tests inside the Workers runtime (Vitest with the Cloudflare pool) |
 | `npm run typecheck` | `tsc --noEmit` |
 | `npm run test:e2e` | The end-to-end suite in `test/e2e/`: real HTTP against `wrangler dev`, the official MCP SDK client, Playwright |
+| `npm run test:scripts` | Tests for `scripts/role-session.sh` (a fake `claude` on PATH) and for the protocol texts matching the relay |
+| `npm run test:live` | The Mods in real `claude -p` sessions against a local relay (costs a few cents with Haiku; see `test/live/README.md`) |
+| `npm run rehearsal` | A live PRD loop with three real Claude Code role sessions (costs a few dollars with Sonnet; see `test/live/README.md`) |
 
 ## 3. Deploy
 
@@ -93,7 +96,7 @@ Cloudflare logs: `wrangler.jsonc` turns Workers Logs' invocation logs off (`"log
 1. Copy a role's URL without it landing in your shell history (macOS):
 
    ```sh
-   printf 'https://%s/mcp/%s' "<worker>" "$(op read 'op://Agent Relay/Developer token/password')" | pbcopy
+   printf 'https://%s/mcp/%s' "<worker>" "$(op read "${OP_REF_DEVELOPER:-op://Agent Relay/Developer token/password}")" | pbcopy
    ```
 
 2. In Claude: **Settings → Connectors → Add custom connector**. Name it, paste the URL, leave OAuth empty, and add it.
@@ -158,14 +161,39 @@ Don't install relay-inbox for this. Start each role with the launcher, which loa
 export RELAY_URL=https://<worker>
 scripts/role-session.sh orchestrator                      # in ~/relay-roles/orchestrator
 scripts/role-session.sh creative-director --model sonnet  # in ~/relay-roles/creative-director
-scripts/role-session.sh developer --dir ~/work/app        # a role directory of your choice
+scripts/role-session.sh developer --dir ~/work/app        # another working directory, e.g. the app repo
 scripts/role-session.sh developer -- --remote-control     # anything after -- goes to claude
 ```
 
-- It takes the role's token from `<ROLE>_TOKEN` (e.g. `DEVELOPER_TOKEN`), else `RELAY_TOKEN`, else `op read` of `OP_REF_<ROLE>` (default `op://Agent Relay/<Role> token/password`, as in section 3). Unless you pass `--no-check`, it asks the relay (`GET /api/me`) and refuses a token that is rejected or belongs to another role.
-- It writes three files into the role directory with mode 600, rewritten at every start: `.relay-inbox.json` (the Mod's options for this role, `{"pluginConfigs": {"relay-inbox": {"options": {"relay_url", "role_token", "auto_wake": true}}}}`), `.relay-mcp.json` (the relay MCP server with this role's `Authorization: Bearer` header) and `.relay-instructions.md` (`PROTOCOL.md` plus the role's addendum). Keep them out of git; the script warns when the directory is in a repository that doesn't ignore them.
-- Then it runs, in that directory, `claude --plugin-dir <repo>/mods/relay-inbox --settings .relay-inbox.json --mcp-config .relay-mcp.json --append-system-prompt-file .relay-instructions.md` with a first prompt, `Session started by scripts/role-session.sh: check your relay inbox and act per the relay protocol.` That first turn matters: function hooks are early access, and when the engine's rollout switch hasn't answered at startup it loads the hooks module only at the first turn start; until then an idle session neither polls nor wakes. With `--no-prompt`, send one prompt yourself. Either way, check that the `Relay · …` status line appears before leaving the session idle.
-- The token is never printed, put on a command line or left in the session's environment. `--dry-run` writes the files and prints the `claude` command instead of running it. `scripts/role-session.sh --help` lists every option.
+- It takes the role's token from `<ROLE>_TOKEN` (e.g. `DEVELOPER_TOKEN`), else `RELAY_TOKEN`, else `op read` of `OP_REF_<ROLE>` (default `op://Agent Relay/<Role> token/password`, as in section 3; better, a service account's vault, below). Unless you pass `--no-check`, it asks the relay (`GET /api/me`) and refuses a token that is rejected or belongs to another role.
+- It writes three files **outside the working directory**, in `${XDG_STATE_HOME:-~/.local/state}/agent-relay/<role>/` (directory mode 700, files mode 600, rewritten at every start): `.relay-inbox.json` (the Mod's options for this role, `{"pluginConfigs": {"relay-inbox": {"options": {"relay_url", "role_token", "auto_wake": true}}}}`), `.relay-mcp.json` (the relay MCP server with this role's `Authorization: Bearer` header) and `.relay-instructions.md` (`PROTOCOL.md` plus the role's addendum). Nothing is written into `--dir`, so an agent's `git add -A` there can't commit a token; copies an earlier version of the script left in `--dir` are deleted, with a warning. It refuses a state directory that sits in a git working tree that doesn't ignore the files.
+- Then it runs, in `--dir`, `claude --plugin-dir <repo>/mods/relay-inbox --settings <state>/.relay-inbox.json --mcp-config <state>/.relay-mcp.json --append-system-prompt-file <state>/.relay-instructions.md` (absolute paths) with a first prompt, `Session started by scripts/role-session.sh: check your relay inbox and act per the relay protocol.` That first turn matters: function hooks are early access, and when the engine's rollout switch hasn't answered at startup it loads the hooks module only at the first turn start; until then an idle session neither polls nor wakes. With `--no-prompt`, send one prompt yourself. Either way, check that the `Relay · …` status line appears before leaving the session idle.
+- The token is never printed or put on a command line. Before starting `claude` the script removes from its environment the relay token variables (`RELAY_TOKEN`, `ORCHESTRATOR_TOKEN`, `CREATIVE_DIRECTOR_TOKEN`, `DEVELOPER_TOKEN`, `HUMAN_TOKEN`), every `OP_*` variable (`OP_SESSION_<account>` from `op signin`, `OP_SERVICE_ACCOUNT_TOKEN`, `OP_CONNECT_TOKEN`, `OP_CONNECT_HOST`) and `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_API_KEY`, `CF_API_TOKEN` and `CF_API_KEY`, so the agent's tools can't use `op` with your session or change the relay's secrets. Other variables pass through. `--dry-run` writes the files and prints the `claude` command instead of running it. `scripts/role-session.sh --help` lists every option.
+
+### Threat model: role sessions under one OS user
+
+The launcher keeps tokens off command lines, out of the environment and out of the working tree. That stops leaks; it is **no isolation**. Every session run as one OS user can do whatever that user can:
+
+- read the other roles' token files (mode 600 doesn't stop the same user) and act as that role;
+- run `op` through the 1Password app's CLI integration (an approval prompt, or a terminal you already authorized), use a `wrangler login` (`npx wrangler secret put HUMAN_TOKEN` makes anyone human; `npx wrangler tail` shows `/mcp/<token>` URLs), and read any file that holds the human token.
+
+So:
+
+- For real separation, run each role as its own OS user (or in its own container or VM), with its own clone of this repo and its own Claude Code login, and start it there: its state directory and `--dir` are then under that user's home.
+- Never run role sessions under the account that holds `wrangler login` for the relay, or that can read the human token. Don't approve a 1Password prompt you didn't cause.
+- Keep the role tokens in a vault of their own that holds only the three role items, never the human token, and let the launcher read them with a 1Password service account (if your plan has them) that can only read that vault:
+
+  ```sh
+  op vault create "Agent Relay Roles"
+  export OP_REF_ORCHESTRATOR="op://Agent Relay Roles/Orchestrator token/password"
+  export OP_REF_CREATIVE_DIRECTOR="op://Agent Relay Roles/Creative Director token/password"
+  export OP_REF_DEVELOPER="op://Agent Relay Roles/Developer token/password"
+  scripts/put-secrets.sh --generate orchestrator creative-director developer   # new tokens, made in that vault
+  op service-account create "Agent Relay role sessions" --vault "Agent Relay Roles:read_items"
+  ```
+
+  The last command prints the service account's token once: keep it out of your shell history, e.g. in the macOS keychain (`security add-generic-password -a "$USER" -s "Agent Relay role sessions" -w`, which prompts for it). Then start role sessions with `OP_SERVICE_ACCOUNT_TOKEN="$(security find-generic-password -w -s "Agent Relay role sessions")"` in front of `scripts/role-session.sh <role>`, with the `OP_REF_<ROLE>` variables above set. The script reads the token with it, then removes it before `claude` starts. Delete the old role items from `Agent Relay` afterwards, and update the connector URLs (section 4).
+- A role that needs a credential of its own (the developer's deploy token for the app) gets one scoped to that job and kept where only that role's user can read it, never a token for the relay's Cloudflare account. Since the launcher removes `CLOUDFLARE_API_TOKEN` and `OP_*`, don't rely on exporting it in the shell you launch from.
 
 ### One role on a machine: install
 
@@ -211,7 +239,7 @@ The kill switch stops every agent in every build at once. Every agent write (`se
 
 Turning the kill switch off tells the orchestrator and the owner of every open task to carry on (a relay `status`, which also wakes sessions running relay-inbox).
 
-Per build, `build_control` takes `halt`, `resume`, `cancel` or `set_caps`. `resume` and `cancel` tell the orchestrator and every open task's owner; `halt` sends nothing (agent writes answer `halted`). A build that reaches its message cap halts itself: raise the cap with `set_caps` (`caps.max_messages`), then `resume`. The ledger page offers both as **Raise cap and resume**.
+Per build, `build_control` takes `halt`, `resume`, `cancel` or `set_caps`. `resume` and `cancel` tell the orchestrator and every open task's owner; `halt` sends nothing (agent writes answer `halted`). A build that reaches its message cap, or its ledger write cap (3 × `max_messages` agent `ledger_update` and `gate_request` calls), halts itself: raise the cap with `set_caps` (`caps.max_messages`), then `resume` (refused while the build is still at a cap). The ledger page offers both as **Raise cap and resume**. `set_caps` never leaves an open task fewer review rounds than the round it is in.
 
 ## 9. Configuration
 
@@ -221,7 +249,7 @@ Per build, `build_control` takes `halt`, `resume`, `cancel` or `set_caps`. `resu
 |---|---|---|
 | `HUMAN_NAME` | `James` | Display name of the `human` role |
 | `NUDGE_AFTER_MINUTES` | `30` | Idle time before a nudge; also the gap before the second-miss escalation. Decimals allowed. |
-| `MAX_MESSAGES_PER_BUILD` | `200` | Hard cap on agent-sent messages per build. Reaching it halts the build. |
+| `MAX_MESSAGES_PER_BUILD` | `200` | Hard cap on agent-sent messages per build; three times it caps agent `ledger_update` and `gate_request` calls. Reaching either halts the build. |
 | `MAX_REVIEW_ROUNDS` | `3` | Review rounds per task before escalation to the human |
 | `BURST_PER_MINUTE` | `10` | Most messages one sender may send in one build in a rolling 60 s |
 | `MAX_ACTIVE_BUILDS` | `1` | Builds not `shipped` or `cancelled` allowed at once |
@@ -241,18 +269,22 @@ Secrets: `ORCHESTRATOR_TOKEN`, `CREATIVE_DIRECTOR_TOKEN`, `DEVELOPER_TOKEN`, `HU
 | A claude.ai connector won't connect | The URL must end in `/mcp/<token>` with nothing after it. Test the relay with the curl below. `GET /mcp` answers 405 by design (stateless JSON, no SSE); unknown paths answer 404. |
 | Two Projects act as the same role | They share one connector. Add one connector per role (section 4). |
 | `whoami` names the wrong role, or the relay's tools appear twice | More than one relay connector is switched on in that Project. Leave only its own. |
-| `conflict` from `send` | Work messages are accepted only while the build is `in_progress`; a verdict needs the task `in_review`; a review request can't target a task that is `blocked`, `done`, `cancelled` or already `in_review`, or one out of review rounds; nothing moves a task escalated to you until you decide its gate. `ledger_get` shows the state. |
-| `forbidden` from `send` | A `review_request` must go to the task's reviewer, and only the task's owner (or the orchestrator) may send one. The orchestrator changes reviewers with `ledger_update`. |
-| `conflict` from `ledger_update` | A reviewer tried to change the status of a task in review (it answers with a verdict), the orchestrator marked a task `done` without an approved verdict for its current round, or changed the reviewer mid-review. |
+| `conflict` from `send` | Work messages are accepted only while the build is `in_progress`; a verdict needs the task `in_review`; a review request can't target a task that is `blocked`, `done`, `cancelled` or already `in_review` (one past the round budget is not refused: it escalates to you); an agent's `next_task_id` must be `todo`, and a done task's finishing handoff goes out once; nothing moves a task escalated to you until you decide its gate. `ledger_get` shows the state. |
+| `forbidden` from `send` | A `review_request` must go to the task's reviewer, and only the task's owner (or the orchestrator) may send one. The orchestrator changes reviewers with `ledger_update`. An agent's handoff may name as `next_task_id` only a task that depends on its finished task or is already the recipient's. |
+| `conflict` from `ledger_update` | A reviewer tried to change the status of a task in review (it answers with a verdict), the orchestrator set a task in review to anything but `cancelled`, marked a task `done` without an approved verdict for its current round, or changed the reviewer of a task that has been reviewed; or the build already has 100 tasks. |
+| `invalid_input` from `ledger_update` | A field is wrong, a task is full (50 links or 50 notes), or `depends_on` would make a cycle. |
 | `halted` | The kill switch is on or the build is halted. The ledger page shows which. |
-| `cap_reached` | The build hit its message cap and halted. Use `set_caps`, then `resume`. |
+| `cap_reached` | The build hit its message cap or its ledger write cap and halted. Raise `max_messages` with `set_caps`, then `resume`. |
 | `rate_limited` | One sender went over `BURST_PER_MINUTE` messages, or `BURST_PER_MINUTE` × 3 `ledger_update` and `gate_request` calls, in a minute in one build. Wait a minute. |
 | `secret_detected` | Something looked like a key or token, or was a role token. Send an `op://` reference instead. |
-| Nudges never show up | Nudges apply only in `in_progress` builds while the kill switch is off, to `ready` tasks (every `depends_on` task closed) that an agent owns, once both the task and its owner have been idle for `NUDGE_AFTER_MINUTES`; any `send` or `ledger_update` by the owner answers them. A role sees a nudge only when it next calls `inbox`, which is the wake problem [`SPIKE.md`](SPIKE.md) settles. |
+| Nudges never show up | Nudges apply only in `in_progress` builds while the kill switch is off, to `ready` tasks (every `depends_on` task `done`) that an agent holds, once both the task and the role it waits on have been idle for `NUDGE_AFTER_MINUTES`; any `send` or `ledger_update` by that role answers them. A task in review nudges its reviewer, or its assignee while the reviewer waits on the assignee's answer. A `blocked` task never nudges its owner: the orchestrator is told after `NUDGE_AFTER_MINUTES`, you after twice that. A role sees a nudge only when it next calls `inbox`, which is the wake problem [`SPIKE.md`](SPIKE.md) settles. |
 | Port 8787 is busy | `npm run dev -- --port 8788`; use that port in the local URLs. |
 | A Mod does nothing | Check `relay_url` and `role_token`. A freshly started session that nobody has typed into may not have loaded its hooks module yet: send one prompt (section 6). Run `claude --debug` and look for lines starting with the Mod's name; `hooks module … not loaded: … rollout switch` means the engine put off loading it until a turn starts, or function hooks are off on this machine. |
 | Role sessions on one machine act as one role: messages vanish from a role's inbox, or the wrong session wakes | relay-inbox is installed, and its options (one set per machine) hold one role's token for every session. Uninstall it and start each role with `scripts/role-session.sh` (section 6). |
 | `role-session: the token from … belongs to orchestrator, not developer` | The token variable or 1Password item holds another role's token, often a leftover `RELAY_TOKEN`. Unset it or fix the `OP_REF_<ROLE>` reference. |
+| `role-session: … is inside a git working tree that doesn't ignore .relay-inbox.json` | The state directory (`$XDG_STATE_HOME`, or `~/.local/state`) is inside a git repository, e.g. a home directory kept in git. Set `XDG_STATE_HOME` to an absolute path outside it. |
+| `role-session: … is not owned by <user>` | The state directory was made by another user (e.g. under `sudo`). Remove it, or set `XDG_STATE_HOME`. |
+| In a role session, `op`, `wrangler` or a deploy can't find a credential that works in your shell | The launcher removes `OP_*` and the Cloudflare token variables on purpose (section 6, threat model). Give that role a credential of its own, scoped to its job. |
 | A spike wake ran in the wrong session, or a headless run answered the wake instead of its prompt | The wake named no `session_id`, so the first session of that role to poll took it. Always pass `role` and `session_id`, and load relay-spike only in the sessions under test. |
 
 MCP check with curl (lists the tools the human token may call):

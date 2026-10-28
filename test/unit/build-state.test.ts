@@ -239,7 +239,8 @@ describe("orchestrator notices", () => {
     await call("developer", "ledger_update", { build_id: buildId, task_id: taskId, status: "blocked", note: "Waiting for the API key" });
     const [blocked] = await readInbox("orchestrator", buildId);
     expect(blocked).toMatchObject({ from: "relay", type: "status", task_id: taskId });
-    expect(blocked.body).toBe("T1 is blocked (developer): Waiting for the API key.");
+    // The note is quoted as the developer's own words, so it can't read as relay text.
+    expect(blocked.body).toBe('T1 is blocked (developer). Their note: "Waiting for the API key"');
 
     await call("human", "ledger_update", { build_id: buildId, task_id: second, status: "cancelled", note: "Out of scope" });
     const [cancelled] = await readInbox("orchestrator", buildId);
@@ -331,5 +332,55 @@ describe("build_control", () => {
     });
     expect(build.caps).toEqual({ max_messages: 10, max_review_rounds: 5 });
     expect((await task(buildId, taskId)).max_rounds).toBe(5);
+  });
+});
+
+describe("close notices", () => {
+  it("name every task the close made ready, with its owner and status", async () => {
+    const { buildId, taskId } = await inProgressBuild();
+    await call("orchestrator", "ledger_update", { build_id: buildId, task_id: taskId, reviewer: null });
+    const ship = await createTask(buildId, { title: "Ship", reviewer: null, depends_on: [taskId] });
+    const copy = await createTask(buildId, { title: "Copy", assignee: "creative-director", reviewer: null, depends_on: [taskId] });
+    const later = await createTask(buildId, { title: "Launch", reviewer: null, depends_on: [ship] });
+    await readInbox("orchestrator", buildId);
+    await call("developer", "ledger_update", { build_id: buildId, task_id: taskId, status: "done" });
+    const [notice] = await readInbox("orchestrator", buildId);
+    expect(notice.body).toBe(
+      `T1 "Main screen" is done (marked done by developer). Now ready: T2 "Ship" (developer, todo); T3 "Copy" (creative-director, todo).`,
+    );
+    expect(await task(buildId, later)).toMatchObject({ ready: false, waiting_on: [ship] });
+    expect(await task(buildId, copy)).toMatchObject({ ready: true });
+  });
+
+  it("name the open tasks a cancelled task still holds up", async () => {
+    const { buildId, taskId } = await inProgressBuild();
+    const ship = await createTask(buildId, { title: "Ship", depends_on: [taskId] });
+    await readInbox("orchestrator", buildId);
+    await call("human", "ledger_update", { build_id: buildId, task_id: taskId, status: "cancelled", note: "Dropped" });
+    const [one] = await readInbox("orchestrator", buildId);
+    expect(one.body).toBe('T1 "Main screen" was cancelled by human: Dropped. T2 depends on it: update T2\'s depends_on or cancel T2.');
+    expect(await task(buildId, ship)).toMatchObject({ ready: false, waiting_on: [taskId] });
+
+    const base = await createTask(buildId, { title: "API" });
+    await createTask(buildId, { title: "Web", depends_on: [base] });
+    await createTask(buildId, { title: "App", depends_on: [base] });
+    await call("human", "ledger_update", { build_id: buildId, task_id: base, status: "cancelled" });
+    const [several] = await readInbox("orchestrator", buildId);
+    expect(several.body).toBe('T3 "API" was cancelled by human. T4 and T5 depend on it: update their depends_on or cancel them.');
+  });
+
+  it("after a rejected escalation, say which tasks wait on the cancelled one instead of releasing them", async () => {
+    const { buildId, taskId } = await inProgressBuild({ caps: { max_review_rounds: 1 } });
+    const ship = await createTask(buildId, { title: "Ship", depends_on: [taskId] });
+    await send("developer", { build_id: buildId, to_role: "cd", type: "review_request", task_id: taskId, links: PREVIEW });
+    await send("creative-director", { build_id: buildId, to_role: "dev", type: "verdict", task_id: taskId, verdict: "changes_requested", changes: ["No"] });
+    await readInbox("orchestrator", buildId);
+    await call("human", "gate_decide", { build_id: buildId, gate_id: "G2", decision: "rejected" });
+    const notices = (await readInbox("orchestrator", buildId)).filter((m: Json) => m.from === "relay");
+    expect(notices.map((m: Json) => m.body)).toEqual([
+      "T1 was cancelled; create a narrower replacement task if the work is still needed. T2 depends on it: update T2's depends_on or cancel T2.",
+    ]);
+    const developerTasks = (await call("developer", "inbox", { build_id: buildId, peek: true })).builds[0].my_tasks;
+    expect(developerTasks.map((t: Json) => [t.id, t.ready, t.waiting_on])).toEqual([[ship, false, [taskId]]]);
   });
 });

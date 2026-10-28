@@ -4,7 +4,7 @@ Tests in this folder run **real Claude Code sessions** (`claude -p`) against a t
 
 | File | What it checks | Run time | Cost |
 |---|---|---|---|
-| `mods.test.mjs` | The two Mods (`mods/relay-spike`, `mods/relay-inbox`) loaded into real sessions: hook reports, injected context, wakes, `/relay-reply`, halts, failure handling | about 4 minutes | about $0.03 with haiku (15 tests, 19 sessions) |
+| `mods.test.mjs` | The two Mods (`mods/relay-spike`, `mods/relay-inbox`) loaded into real sessions: hook reports, injected context, wakes, `/relay-reply`, halts, failure handling | about 5 minutes | about $0.05 with haiku (20 tests, about 24 sessions) |
 | `rehearsal.mjs` | The whole PRD loop with three role agents (Plan B): kickoff, plan approval, design, build, review, ship, final sign-off | until the build ships (3 to 6 minutes for the sample brief), or `--minutes` (45) | real: $3 to $4 with sonnet for the sample brief; capped by `--max-invocations` (40) |
 
 ## Before you run
@@ -26,7 +26,7 @@ RUN_LIVE=1 NO_PROXY=127.0.0.1,localhost node --test test/live/mods.test.mjs
 | `LIVE_MODEL` | `haiku` | the `--model` given to every session |
 | `LIVE_KEEP` | unset | `1` keeps the temp folder with each session's `--debug-file` log and MCP config |
 
-Output is the `node --test` report. Near the end, a line gives the number of sessions and what `claude` reported they cost, for example `# live Mod checks: 19 claude sessions, $0.0334 as reported by claude (haiku)`. Some of those sessions only run a Mod command (`/relay-spike`, `/relay-reply`), which costs nothing.
+Output is the `node --test` report. Near the end, a line gives the number of sessions and what `claude` reported they cost, for example `# live Mod checks: 24 claude sessions, $0.0455 as reported by claude (haiku)`. Some of those sessions only run a Mod command (`/relay-spike`, `/relay-reply`), which costs nothing.
 
 Nothing is installed, and no settings file is changed. Each session:
 
@@ -75,7 +75,7 @@ RUN_LIVE=1 NO_PROXY=127.0.0.1,localhost node test/live/rehearsal.mjs [--model so
 | `--nudge` | `4` | `NUDGE_AFTER_MINUTES` for the throwaway relay, so nudges show up within a short run |
 | `--out` | a new `agent-relay-rehearsal-<time>` folder in the system temp dir | where the report, the app and the logs go |
 
-What it does: it starts a relay and a static preview server for a shared workspace, then creates a build with a small sample brief (a "Split the bill" calculator) as James. Each role (`orchestrator`, `creative-director`, `developer`) runs as `claude -p` in that workspace, with the relay as its only MCP server, `protocol/PROTOCOL.md` plus its addendum appended to the system prompt, and `--resume`, so every wake continues one conversation per role. The driver stands in for relay-inbox's wake path: every 4 s it peeks each role's inbox and wakes a role that has unread mail with the Mod's exact wake prompt. It also stands in for James: it approves every gate (escalations get one more round) and answers every question with "use your judgement". Everything the agents do goes through the relay.
+What it does: it starts a relay and a static preview server for a shared workspace, then creates a build with a small sample brief (a "Split the bill" calculator) as James. Each role (`orchestrator`, `creative-director`, `developer`) runs as `claude -p` in that workspace, with the relay as its only MCP server, `protocol/PROTOCOL.md` plus its addendum appended to the system prompt, and `--resume`, so every wake continues one conversation per role. As `scripts/role-session.sh` does, it starts them without the relay token variables, any `OP_*` variable or the Cloudflare API token variables in their environment. The driver stands in for relay-inbox's wake path: every 4 s it peeks each role's inbox and wakes a role that has unread mail with the Mod's exact wake prompt. It also stands in for James: it approves every gate (escalations get one more round) and answers every question with "use your judgement". Everything the agents do goes through the relay.
 
 It prints one line per event (`wake developer #2: …`, `done developer #2 (exit 0, 7 turns, $0.31): …`, `James decided plan_approval G1: approved`, `build shipped`), and leaves in `--out`:
 

@@ -1337,6 +1337,56 @@ describe("ledger page against a real relay", { skip: MISSING_PLAYWRIGHT, timeout
     }
   });
 
+  pageTest("ledger-write-cap halt: the raise form counts the writes and asks for a cap that clears them", async () => {
+    const r = await launchRelay({ vars: { ...RELAY_VARS, MAX_MESSAGES_PER_BUILD: "3" } });
+    try {
+      const sd = seeder(r);
+      const { id, taskId } = await sd.inProgress("Write cap build");
+      let capped = null;
+      for (let n = 1; n <= 12 && !capped; n++) {
+        const res = await r.call("developer", "ledger_update", { build_id: id, task_id: taskId, note: `note ${n}` });
+        if (!res.ok) capped = res;
+      }
+      assert.equal(capped?.error.code, "cap_reached");
+      const halted = (await sd.ledger(id)).build;
+      assert.equal(halted.halt_reason, "ledger write cap reached");
+      assert.equal(halted.write_count, 9, "3 × the message cap of 3");
+      const least = Math.max(halted.message_count + 1, Math.floor(halted.write_count / 3) + 1);
+
+      const s = await openPage({ hash: `#${id}`, target: r, viewport: PHONE });
+      const { page } = s;
+      const controls = [];
+      page.on("request", (q) => { if (new URL(q.url()).pathname === "/api/call/build_control") controls.push(q.postDataJSON()); });
+      try {
+        await page.waitForSelector(".callout .cap-form");
+        assert.match(await text(page, ".callout"), /ledger write cap reached/);
+        assert.equal(await text(page, ".cap-form label"), `New message cap (${halted.message_count} of 3 agent messages used; 9 of 9 ledger writes used)`);
+        assert.equal(await page.getAttribute(".cap-form input", "min"), String(least));
+
+        // A cap that would leave the write cap where it is gets refused on the page, with nothing sent.
+        await page.fill(".cap-form input", String(least - 1));
+        await page.click(".cap-form button:has-text('Raise cap and resume')");
+        await page.waitForFunction(() => document.querySelector(".cap-form .form-error")?.textContent.length > 0);
+        assert.match(await text(page, ".cap-form .form-error"), new RegExp(`Enter a whole number from ${least} to 10000`));
+        assert.deepEqual(controls, []);
+
+        await page.fill(".cap-form input", String(least));
+        await page.click(".cap-form button:has-text('Raise cap and resume')");
+        await page.waitForSelector(`.toast:has-text('Message cap raised to ${least}')`);
+        await page.waitForFunction(() => document.querySelector(".detail-meta .pill")?.textContent === "In progress");
+        assert.deepEqual(controls, [
+          { build_id: id, action: "set_caps", caps: { max_messages: least } },
+          { build_id: id, action: "resume" },
+        ]);
+        s.check();
+      } finally {
+        await s.close();
+      }
+    } finally {
+      await r.stop();
+    }
+  });
+
   pageTest("a task that missed two nudges shows as stalled", async () => {
     const r = await launchRelay({ vars: { ...RELAY_VARS, NUDGE_AFTER_MINUTES: "0.05" } });
     try {

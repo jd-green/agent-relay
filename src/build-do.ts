@@ -15,8 +15,8 @@ import {
   type Gate,
   type GateKind,
   type GateStatus,
-  type Halted,
   type InboxBuild,
+  type KillState,
   type Ledger,
   type Link,
   type Message,
@@ -46,6 +46,7 @@ CREATE TABLE build (
   max_messages INTEGER NOT NULL,
   max_review_rounds INTEGER NOT NULL,
   message_count INTEGER NOT NULL DEFAULT 0,
+  write_count INTEGER NOT NULL DEFAULT 0,
   rev INTEGER NOT NULL DEFAULT 0,
   created_by TEXT NOT NULL,
   created_ms INTEGER NOT NULL,
@@ -135,7 +136,8 @@ CREATE TABLE audit (
 /**
  * Tables added after the first release. init() creates them with SCHEMA; migrate() adds them to builds an
  * earlier version stored. `writes` logs agent ledger_update / gate_request calls (write burst limit, activity);
- * `local_state` holds this build's copy of the global kill switch, the summary-retry flag and the idle-build watch.
+ * `local_state` holds this build's copy of the global kill switch (with its epoch), the summary-retry flag and
+ * the idle-build watch; `notices` records when each task last caused a blocked or done notice (coalescing).
  */
 const ADDED_SCHEMA = `
 CREATE TABLE IF NOT EXISTS writes (
@@ -152,13 +154,29 @@ CREATE TABLE IF NOT EXISTS local_state (
   summary_dirty INTEGER NOT NULL DEFAULT 0,
   idle_since_ms INTEGER,
   idle_nudge_count INTEGER NOT NULL DEFAULT 0,
-  idle_last_nudge_ms INTEGER
+  idle_last_nudge_ms INTEGER,
+  kill_epoch INTEGER NOT NULL DEFAULT 0
 );
 INSERT OR IGNORE INTO local_state (id) VALUES (1);
+CREATE TABLE IF NOT EXISTS notices (
+  task_num INTEGER NOT NULL,
+  kind TEXT NOT NULL,
+  at_ms INTEGER NOT NULL,
+  PRIMARY KEY (task_num, kind)
+);
 `;
 
-/** Tasks the nudger may watch (they must also be ready, and the build in_progress). */
+/** Columns added to tables that existed in an earlier release: [table, column, type]. */
+const ADDED_COLUMNS: readonly [string, string, string][] = [
+  ["messages", "next_task_id", "TEXT"],
+  ["build", "write_count", "INTEGER NOT NULL DEFAULT 0"],
+  ["local_state", "kill_epoch", "INTEGER NOT NULL DEFAULT 0"],
+];
+
+/** Tasks the nudger may watch (they must also be ready, and the build in_progress; DESIGN §8). */
 const WATCHED_TASK = "status NOT IN ('done', 'cancelled') AND owner IS NOT NULL AND owner <> 'human' AND nudge_count < 2";
+/** Open tasks held by an agent: while none of them is ready (and no gate is pending) the idle-build watch runs. */
+const AGENT_TASK = "status NOT IN ('done', 'cancelled') AND owner IS NOT NULL AND owner <> 'human'";
 const OPEN_TASK = "status NOT IN ('done', 'cancelled')";
 const LEDGER_TAIL = 50;
 const EXCERPT_LENGTH = 140;
@@ -170,6 +188,14 @@ const SLIM_ARTIFACTS = 5;
 const SLIM_NOTES = 3;
 /** Agent ledger_update + gate_request calls allowed per role per build per 60 s, as a multiple of BURST_PER_MINUTE. */
 const WRITE_BURST_FACTOR = 3;
+/** Agent ledger_update + gate_request calls allowed per build, as a multiple of its max_messages (DESIGN §7). */
+const WRITE_CAP_FACTOR = 3;
+/** Tasks a build holds at most (DESIGN §5). */
+const MAX_TASKS = 100;
+/** Agent-written text quoted in a relay notice is cut to this length. */
+const QUOTE_LENGTH = 500;
+/** Open tasks named in the idle-build nudge. */
+const LISTED_TASKS = 10;
 const SUMMARY_RETRY_MS = 60_000;
 const SIGNOFF_HINT = " Every task is closed: request final_signoff.";
 
@@ -185,6 +211,7 @@ type BuildRow = {
   max_messages: number;
   max_review_rounds: number;
   message_count: number;
+  write_count: number;
   rev: number;
   created_by: Role;
   created_ms: number;
@@ -282,6 +309,8 @@ type LocalStateRow = {
   idle_since_ms: number | null;
   idle_nudge_count: number;
   idle_last_nudge_ms: number | null;
+  /** Epoch of the kill switch copy above (DESIGN §7). */
+  kill_epoch: number;
 };
 
 /** A task as it is edited in memory before being written back in one UPDATE. */
@@ -307,10 +336,19 @@ interface NewMessage {
   on_behalf_of?: Role | null;
 }
 
-/** One thing the nudger watches: a task (owned by `owner`), or the idle build itself (task null, owner orchestrator). */
+/**
+ * Why a task is watched (DESIGN §8): `idle` (its owner should move it), `review` (its reviewer owes a verdict),
+ * `answer` (its reviewer asked the assignee a question that is still unanswered) or `blocked` (the orchestrator
+ * should unblock it).
+ */
+type NudgeKind = "idle" | "review" | "answer" | "blocked";
+
+/** One thing the nudger watches: a task, or the idle build itself (task null, target orchestrator). */
 interface NudgeItem {
   task: TaskState | null;
-  owner: Role;
+  kind: NudgeKind;
+  /** Who is nudged: the owner, the assignee who owes an answer, or the orchestrator (blocked task, idle build). */
+  target: Role;
   /** 1: the first nudge is due next; 2: the second-miss escalation is. */
   step: 1 | 2;
   due: number;
@@ -326,7 +364,7 @@ export interface InitInput {
   caps?: { max_messages?: number; max_review_rounds?: number };
   created_by: Role;
   /** The global kill switch when RelayDO reserved the build. */
-  halted?: Halted;
+  kill?: KillState;
 }
 
 export interface InboxOptions {
@@ -382,8 +420,21 @@ const GATE_LABELS: Record<GateKind, string> = {
 
 const taskId = (num: number) => `T${num}`;
 const idNumber = (id: string) => Number(id.slice(1));
-const label = (task: TaskState) => `${taskId(task.num)} "${task.title}"`;
+/** `T2 "Title"`, the title quoted so it can't break out of its quotes. */
+const label = (task: TaskState) => `${taskId(task.num)} ${JSON.stringify(task.title)}`;
 const isClosed = (status: TaskStatus) => CLOSED_TASK_STATUSES.includes(status);
+const plural = (n: number, one: string, many: string) => (n === 1 ? one : many);
+
+/** Agent-written text inside a relay notice: one line, cut short and in quotes, so it can't read as relay text. */
+function quoted(text: string): string {
+  const flat = text.replace(/\s+/g, " ").trim();
+  return JSON.stringify(flat.length > QUOTE_LENGTH ? `${flat.slice(0, QUOTE_LENGTH - 1)}…` : flat);
+}
+
+/** "T5", "T5 and T6", "T5, T6 and T7". */
+function joined(items: readonly string[]): string {
+  return items.length <= 1 ? (items[0] ?? "") : `${items.slice(0, -1).join(", ")} and ${items.at(-1)}`;
+}
 
 function parseJson<T>(text: string | null, fallback: T): T {
   return text === null ? fallback : (JSON.parse(text) as T);
@@ -399,8 +450,9 @@ function formatDuration(ms: number): string {
   return minutes >= 1 ? `${minutes} min` : `${Math.max(1, Math.round(ms / 1000))} s`;
 }
 
+/** A numbered list, one line per item (an item's own line breaks are flattened so it can't forge list lines). */
 function numbered(items: readonly string[], maxLength = 2000): string {
-  const text = items.map((item, index) => `${index + 1}. ${item}`).join("\n");
+  const text = items.map((item, index) => `${index + 1}. ${item.replace(/\s+/g, " ").trim()}`).join("\n");
   return text.length > maxLength ? `${text.slice(0, maxLength - 1)}…` : text;
 }
 
@@ -421,8 +473,8 @@ export class BuildDO extends DurableObject<Env> {
   private readonly config: Config;
   /** Null until init() has run; only init() creates tables, so probing an unknown id stores nothing. */
   private buildId: string | null = null;
-  /** A kill switch push that arrived while init() was still in flight. */
-  private pendingHalt: Halted | null = null;
+  /** The newest kill switch push that arrived while init() was still in flight. */
+  private pendingKill: KillState | null = null;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -437,10 +489,11 @@ export class BuildDO extends DurableObject<Env> {
 
   // ---------------------------------------------------------------- RPC methods
 
-  init(input: InitInput): Outcome<{ build: Build; summary: BuildSummary }> {
+  /** Creates the build; `epoch` is the kill switch epoch it starts with (RelayDO records it as acknowledged). */
+  init(input: InitInput): Outcome<{ build: Build; summary: BuildSummary; epoch: number }> {
     if (this.buildId !== null) return { ok: false, error: { code: "conflict", message: "build already exists" } };
     this.buildId = input.build_id;
-    let outcome: Outcome<{ build: Build; summary: BuildSummary }> | undefined;
+    let outcome: Outcome<{ build: Build; summary: BuildSummary; epoch: number }> | undefined;
     try {
       outcome = this.mutate(() => this.createBuild(input));
       return outcome;
@@ -449,36 +502,29 @@ export class BuildDO extends DurableObject<Env> {
     }
   }
 
-  async send(actor: Role, input: SendInput): Promise<Outcome<SendResult>> {
-    const outcome = this.mutate(() => this.applySend(actor, input));
-    if (!outcome.ok && outcome.error.code === "cap_reached") {
-      this.mutate(() => this.haltForCap(actor));
-    } else if (!outcome.ok) {
-      return outcome;
-    }
-    await this.afterChange();
-    return outcome;
+  /** `kill` is the kill switch as the Worker read it for this call (DESIGN §7); so are the other writes'. */
+  send(actor: Role, input: SendInput, kill?: KillState): Promise<Outcome<SendResult>> {
+    return this.write(kill, () => this.applySend(actor, input), { actor, cap: "message" });
   }
 
-  updateTask(actor: Role, input: LedgerUpdateInput): Promise<Outcome<{ task: Task }>> {
-    return this.write(() => this.applyLedgerUpdate(actor, input));
+  updateTask(actor: Role, input: LedgerUpdateInput, kill?: KillState): Promise<Outcome<{ task: Task }>> {
+    return this.write(kill, () => this.applyLedgerUpdate(actor, input), { actor, cap: "write" });
   }
 
-  requestGate(actor: Role, input: ToolInput<"gate_request">): Promise<Outcome<{ gate: Gate; build: Build }>> {
-    return this.write(() => this.applyGateRequest(actor, input));
+  requestGate(actor: Role, input: ToolInput<"gate_request">, kill?: KillState): Promise<Outcome<{ gate: Gate; build: Build }>> {
+    return this.write(kill, () => this.applyGateRequest(actor, input), { actor, cap: "write" });
   }
 
-  async decideGate(actor: Role, input: ToolInput<"gate_decide">): Promise<Outcome<GateDecision>> {
-    const outcome = this.mutate(() => this.applyGateDecision(actor, input));
+  async decideGate(actor: Role, input: ToolInput<"gate_decide">, kill?: KillState): Promise<Outcome<GateDecision>> {
+    const outcome = await this.write(kill, () => this.applyGateDecision(actor, input));
     if (!outcome.ok) return outcome;
-    await this.afterChange();
     // A stale escalation gate was cancelled (and that is saved), but the decision itself is refused.
     if ("refused" in outcome.result) return { ok: false, error: { code: "conflict", message: outcome.result.refused } };
     return { ok: true, result: outcome.result };
   }
 
-  control(actor: Role, input: ToolInput<"build_control">): Promise<Outcome<{ build: Build }>> {
-    return this.write(() => this.applyControl(actor, input));
+  control(actor: Role, input: ToolInput<"build_control">, kill?: KillState): Promise<Outcome<{ build: Build }>> {
+    return this.write(kill, () => this.applyControl(actor, input));
   }
 
   async inbox(actor: Role, options: InboxOptions): Promise<Outcome<InboxBuild>> {
@@ -518,33 +564,32 @@ export class BuildDO extends DurableObject<Env> {
 
   /**
    * RelayDO pushes every kill switch toggle here before it answers, so agent writes check the switch inside
-   * their own transaction (DESIGN §7). Clearing it (clearedBy set) restarts the idle clocks, since time under
-   * the switch is not idle time, and tells the orchestrator and every open task's owner to carry on.
+   * their own transaction (DESIGN §7). Resolves to the epoch this build now holds, which RelayDO records as
+   * acknowledged (0 while init() is still in flight, so RelayDO pushes again).
    */
-  async setGlobalHalt(halted: Halted, clearedBy: Role | null): Promise<void> {
+  async setGlobalHalt(state: KillState): Promise<number> {
     if (this.buildId === null) {
-      this.pendingHalt = halted; // init() is still in flight; it stores this instead of its older copy
-      return;
+      if (this.pendingKill === null || state.epoch > this.pendingKill.epoch) this.pendingKill = state;
+      return 0;
     }
-    const notified = this.mutate(() => {
-      this.storeGlobalHalt(halted);
-      const build = this.loadBuild();
-      if (clearedBy === null || build.status === "halted" || CLOSED_BUILD_STATUSES.includes(build.status)) return false;
-      const now = Date.now();
-      if (build.status === "in_progress") this.restartClocks(now);
-      this.lifecycleNotice(`Relay kill switch cleared by ${displayName(clearedBy, this.config)}. Carry on from the ledger.`, now);
-      this.saveBuild(build, now);
-      return true;
-    });
-    if (notified.ok && notified.result) await this.afterChange();
+    if (this.adoptKill(state)) await this.afterChange();
+    return this.localState().kill_epoch;
   }
 
   override async alarm(): Promise<void> {
     if (this.buildId === null) return;
-    const halted = await relayStub(this.env).getKillSwitch();
-    this.mutate(() => this.storeGlobalHalt(halted)); // corrects a missed push
-    if (halted.global) {
-      // Nudges pause while the kill switch is on; look again later in case the "off" notice is missed.
+    let state: KillState | null = null;
+    try {
+      state = await relayStub(this.env).killState();
+    } catch (err) {
+      // RelayDO is unreachable: carry on with this build's copy; the summary retry below still runs.
+      console.error("reading the kill switch from RelayDO failed; the build keeps its own copy", err);
+    }
+    // A push may have landed while the read was in flight: adoptKill never replaces a newer copy with an older one.
+    // From here to processNudges nothing awaits, so the switch can't change in between.
+    this.adoptKill(state);
+    if (this.localState().global_halted === 1) {
+      // Nudges pause while the kill switch is on; RelayDO keeps pushing until this build has the "off".
       if (this.nextNudgeDue() !== null) await this.ctx.storage.setAlarm(Date.now() + this.config.nudgeAfterMs);
       if (this.localState().summary_dirty === 1) await this.pushSummary();
       return;
@@ -560,15 +605,30 @@ export class BuildDO extends DurableObject<Env> {
     return capture(() => this.ctx.storage.transactionSync(fn));
   }
 
-  private async write<T>(fn: () => T): Promise<Outcome<T>> {
+  /**
+   * One write: adopt the caller's kill switch read if it is newer, run fn atomically, then reschedule and push
+   * the summary. A cap_reached failure halts the build (message cap for send, write cap for ledger writes).
+   */
+  private async write<T>(
+    kill: KillState | undefined,
+    fn: () => T,
+    capped?: { actor: Role; cap: "message" | "write" },
+  ): Promise<Outcome<T>> {
+    let changed = this.adoptKill(kill);
     const outcome = this.mutate(fn);
-    if (outcome.ok) await this.afterChange();
+    if (outcome.ok) changed = true;
+    else if (outcome.error.code === "cap_reached" && capped) {
+      this.mutate(() => this.haltForCap(capped.actor, capped.cap));
+      changed = true;
+    }
+    if (changed) await this.afterChange();
     return outcome;
   }
 
+  /** Pushes the summary, then schedules the alarm for the next nudge (or the summary retry if the push failed). */
   private async afterChange(): Promise<void> {
-    await this.reschedule();
     await this.pushSummary();
+    await this.reschedule();
   }
 
   /** The write already committed; if RelayDO can't take the summary now, the alarm retries it (DESIGN §4). */
@@ -610,21 +670,49 @@ export class BuildDO extends DurableObject<Env> {
 
   /** Brings a build stored by an earlier version up to the current schema. */
   private migrate(): void {
-    const columns = this.sql.exec<{ name: string }>("PRAGMA table_info(messages)").toArray();
-    if (!columns.some((column) => column.name === "next_task_id")) this.sql.exec("ALTER TABLE messages ADD COLUMN next_task_id TEXT");
     this.sql.exec(ADDED_SCHEMA);
+    for (const [table, column, type] of ADDED_COLUMNS) {
+      const columns = this.sql.exec<{ name: string }>(`PRAGMA table_info(${table})`).toArray();
+      if (!columns.some((row) => row.name === column)) this.sql.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`);
+    }
   }
 
   private localState(): LocalStateRow {
     return this.sql.exec<LocalStateRow>("SELECT * FROM local_state").one();
   }
 
-  private storeGlobalHalt(halted: Halted): void {
+  private storeKill(state: KillState): void {
     this.sql.exec(
-      "UPDATE local_state SET global_halted = ?, global_halt_reason = ?",
-      halted.global ? 1 : 0,
-      halted.global ? halted.reason : null,
+      "UPDATE local_state SET global_halted = ?, global_halt_reason = ?, kill_epoch = ?",
+      state.halted.global ? 1 : 0,
+      state.halted.global ? state.halted.reason : null,
+      state.epoch,
     );
+  }
+
+  /**
+   * Adopts a kill switch state read from RelayDO (a push, the Worker's read passed with a write, or the alarm's
+   * read) when its epoch is newer than this build's copy; an older one never replaces a newer one (DESIGN §7).
+   * When the switch went off, idle clocks restart (time under the switch is not idle time) and the orchestrator
+   * and every open task's owner are told to carry on. Returns true when that notice went out.
+   */
+  private adoptKill(state: KillState | null | undefined): boolean {
+    if (!state || this.buildId === null) return false;
+    const outcome = this.mutate(() => {
+      const local = this.localState();
+      if (state.epoch <= local.kill_epoch) return false;
+      this.storeKill(state);
+      if (state.halted.global || (local.global_halted === 0 && !state.cleared)) return false;
+      const build = this.loadBuild();
+      if (build.status === "halted" || CLOSED_BUILD_STATUSES.includes(build.status)) return false;
+      const now = Date.now();
+      if (build.status === "in_progress") this.restartClocks(now);
+      const by = displayName(state.by ?? "human", this.config);
+      this.lifecycleNotice(`Relay kill switch cleared by ${by}. Carry on from the ledger.`, now);
+      this.saveBuild(build, now);
+      return true;
+    });
+    return outcome.ok && outcome.result;
   }
 
   private human(): string {
@@ -633,11 +721,15 @@ export class BuildDO extends DurableObject<Env> {
 
   // ---------------------------------------------------------------- init
 
-  private createBuild(input: InitInput): { build: Build; summary: BuildSummary } {
+  private createBuild(input: InitInput): { build: Build; summary: BuildSummary; epoch: number } {
     const now = Date.now();
     this.sql.exec(SCHEMA);
     this.sql.exec(ADDED_SCHEMA);
-    this.storeGlobalHalt(this.pendingHalt ?? input.halted ?? { global: false, reason: null, at: null });
+    const kill = [this.pendingKill, input.kill].reduce<KillState | null>(
+      (newest, state) => (state && (!newest || state.epoch > newest.epoch) ? state : newest),
+      null,
+    );
+    if (kill) this.storeKill(kill);
     this.sql.exec(
       `INSERT INTO build (id, build_id, title, brief, status, gate_plan_approval, gate_final_signoff,
          max_messages, max_review_rounds, created_by, created_ms, updated_ms)
@@ -659,7 +751,7 @@ export class BuildDO extends DurableObject<Env> {
       this.insertMessage({ from: "human", to: "orchestrator", type: "task", body: input.brief }, now);
     }
     const build = this.loadBuild();
-    return { build: this.buildOut(build), summary: this.summaryOf(build) };
+    return { build: this.buildOut(build), summary: this.summaryOf(build), epoch: this.localState().kill_epoch };
   }
 
   // ---------------------------------------------------------------- send
@@ -688,6 +780,8 @@ export class BuildDO extends DurableObject<Env> {
       this.checkLimits(actor, build, now);
       build.message_count += 1;
     }
+    // Who the nudger watches for this task, before this message (which may be the awaited answer) is stored.
+    const target = task ? this.nudgeTarget(task) : null;
 
     const message = this.insertMessage(
       {
@@ -707,9 +801,12 @@ export class BuildDO extends DurableObject<Env> {
     const result: SendResult = { message };
     if (task) {
       const before = structuredClone(task);
-      // A message from the task's current owner is activity on that task.
-      if (task.owner === actor) this.resetNudges(task, now);
+      // A message from the task's current owner, or from the role the nudger watches for it, is activity on it,
+      // except on a blocked task: its clock runs from when it became blocked (DESIGN §8).
+      if ((task.owner === actor || target === actor) && task.status !== "blocked") this.resetNudges(task, now);
       const effects = this.applySendEffects(actor, to, input, task, message, links, now);
+      // Entering or leaving blocked (e.g. a task message to the same owner) starts a new watch.
+      if ((before.status === "blocked") !== (task.status === "blocked")) this.resetNudges(task, now);
       this.releaseEscalation(actor, before, task, now);
       this.commitTask(actor, before, task, now);
       if (!isClosed(before.status) && isClosed(task.status)) {
@@ -745,7 +842,7 @@ export class BuildDO extends DurableObject<Env> {
       case "handoff":
         if (type === "task" && !elevated) fail("forbidden", "only the orchestrator or the human may send task messages");
         if (type === "handoff" && input.next_task_id !== undefined) {
-          this.validateFinishingHandoff(actor, task, input.next_task_id);
+          this.validateFinishingHandoff(actor, to, task, input.next_task_id);
           return;
         }
         if (type === "handoff" && !elevated && task.owner !== actor) {
@@ -774,7 +871,7 @@ export class BuildDO extends DurableObject<Env> {
             `${id}'s reviewer is ${task.reviewer}; send the review_request there (only the orchestrator or ${this.human()} change reviewers, with ledger_update)`,
           );
         }
-        if (task.round + 1 > task.max_rounds) fail("conflict", `${id} has used all ${task.max_rounds} review rounds`);
+        // Past the round budget the request is not refused: it escalates to the human (applySendEffects).
         return;
       case "verdict":
         if (input.verdict === undefined) fail("invalid_input", "verdict messages need verdict: approved or changes_requested");
@@ -795,8 +892,10 @@ export class BuildDO extends DurableObject<Env> {
   /**
    * handoff with next_task_id: task is the sender's finished work and the recipient continues on another task.
    * A task with no reviewer and no review yet is closed by the handoff; any other must already be done (approved).
+   * An agent may only pass on what the plan already gives `to`: a todo task that depends on the finished one or
+   * is already assigned to `to`, and a done task's assignee says what comes next only once (DESIGN §6).
    */
-  private validateFinishingHandoff(actor: Role, task: TaskState, nextId: string): void {
+  private validateFinishingHandoff(actor: Role, to: Role, task: TaskState, nextId: string): void {
     const id = taskId(task.num);
     const elevated = actor === "orchestrator" || actor === "human";
     const done = task.status === "done";
@@ -814,13 +913,38 @@ export class BuildDO extends DurableObject<Env> {
         `${id} ${task.reviewer ? `has a reviewer (${task.reviewer})` : "has been reviewed"}: it is finished only with an approved verdict, so request review first`,
       );
     }
+    if (!elevated && done) {
+      const earlier = this.finishingHandoff(id);
+      if (earlier) fail("conflict", `${id}'s finishing handoff was already sent (${earlier}); ask the orchestrator for what comes next`);
+    }
     const next = this.loadTask(nextId);
     if (next.num === task.num) fail("invalid_input", "next_task_id must name another task than task_id");
     this.assertTaskOpen(next);
-    if (next.status === "in_review" && actor !== "human") {
-      fail("conflict", `${nextId} is in review; its reviewer must send a verdict first`);
+    // The human may name any open task (an escalated one is released by the handoff).
+    if (actor === "human") return;
+    this.assertNotEscalated(next);
+    if (next.status === "in_review") fail("conflict", `${nextId} is in review; its reviewer must send a verdict first`);
+    if (actor === "orchestrator") return;
+    if (next.status !== "todo") {
+      fail("conflict", `${nextId} is ${next.status}, not todo: only the orchestrator or ${this.human()} move a task already under way`);
     }
-    if (actor !== "human") this.assertNotEscalated(next);
+    if (!next.depends_on.includes(id) && next.assignee !== to) {
+      fail(
+        "forbidden",
+        `${nextId} neither depends on ${id} nor is assigned to ${to}; only the orchestrator or ${this.human()} reassign it`,
+      );
+    }
+  }
+
+  /** The id of the first handoff that named a next task after `id` was finished, if any. */
+  private finishingHandoff(id: string): string | null {
+    const row = this.sql
+      .exec<{ seq: number }>(
+        "SELECT seq FROM messages WHERE type = 'handoff' AND task_id = ? AND next_task_id IS NOT NULL ORDER BY seq LIMIT 1",
+        id,
+      )
+      .toArray()[0];
+    return row ? `M${row.seq}` : null;
   }
 
   private checkLimits(actor: Role, build: BuildRow, now: number): void {
@@ -836,6 +960,11 @@ export class BuildDO extends DurableObject<Env> {
     if (n >= this.config.burstPerMinute) {
       fail("rate_limited", `${actor} sent ${n} messages in the last 60 s (limit ${this.config.burstPerMinute}); wait and retry`);
     }
+  }
+
+  /** The round a review_request starts: a new one only if the current round got a verdict (or none ran yet). */
+  private nextRound(task: TaskState): number {
+    return task.round === 0 || this.latestVerdict(taskId(task.num), task.round) !== null ? task.round + 1 : task.round;
   }
 
   private applySendEffects(
@@ -863,13 +992,17 @@ export class BuildDO extends DurableObject<Env> {
         task.status = "todo";
         this.addArtifacts(task, links, false);
         return none;
-      case "review_request":
-        task.round += 1;
+      case "review_request": {
+        this.addArtifacts(task, links, false);
+        // An abandoned round (no verdict) is reused; past the budget the request escalates instead of failing.
+        const round = this.nextRound(task);
+        if (round > task.max_rounds) return { gate: this.escalate(task, { kind: "budget", requester: actor }, now), next: null };
+        task.round = round;
         task.reviewer = to;
         this.setOwner(task, to, now);
         task.status = "in_review";
-        this.addArtifacts(task, links, false);
         return none;
+      }
       case "verdict": {
         const verdict = input.verdict as VerdictValue; // presence checked by validateSend
         this.sql.exec(
@@ -887,7 +1020,9 @@ export class BuildDO extends DurableObject<Env> {
           this.setOwner(task, null, now);
           return none;
         }
-        if (task.round >= task.max_rounds) return { gate: this.escalate(actor, task, input.changes ?? [], now), next: null };
+        if (task.round >= task.max_rounds) {
+          return { gate: this.escalate(task, { kind: "cap", reviewer: actor, changes: input.changes ?? [] }, now), next: null };
+        }
         task.status = "changes_requested";
         this.setOwner(task, task.assignee, now);
         return none;
@@ -911,12 +1046,32 @@ export class BuildDO extends DurableObject<Env> {
     next.status = "todo";
     this.resetNudges(next, now);
     this.addArtifacts(next, links, false);
+    // Only the human can name an escalated task; handing it on drops the escalation.
+    this.releaseEscalation(actor, before, next, now);
     this.commitTask(actor, before, next, now);
     return next;
   }
 
-  /** The review cap was hit: block the task, hand it to the human and open an escalation gate. */
-  private escalate(reviewer: Role, task: TaskState, changes: string[], now: number): Gate {
+  /** The latest changes_requested verdict on a task, if any. */
+  private latestChanges(id: string): { reviewer: Role; round: number; changes: string[] } | null {
+    const row = this.sql
+      .exec<{ reviewer: Role; round: number; changes: string | null }>(
+        "SELECT reviewer, round, changes FROM verdicts WHERE task_id = ? AND verdict = 'changes_requested' ORDER BY num DESC LIMIT 1",
+        id,
+      )
+      .toArray()[0];
+    return row ? { reviewer: row.reviewer, round: row.round, changes: parseJson<string[]>(row.changes, []) } : null;
+  }
+
+  /**
+   * Block the task, hand it to the human and open an escalation gate: either the review cap was hit (a
+   * changes_requested verdict in the last round) or a review_request needs a round past the budget.
+   */
+  private escalate(
+    task: TaskState,
+    reason: { kind: "cap"; reviewer: Role; changes: string[] } | { kind: "budget"; requester: Role },
+    now: number,
+  ): Gate {
     const id = taskId(task.num);
     task.status = "blocked";
     task.escalated = true;
@@ -924,29 +1079,37 @@ export class BuildDO extends DurableObject<Env> {
     // Never two pending escalations for one task.
     const pending = this.pendingEscalation(id);
     if (pending) return this.loadGate(pending);
+    const latest = reason.kind === "cap" ? { reviewer: reason.reviewer, changes: reason.changes } : this.latestChanges(id);
+    const changeList = latest
+      ? `Latest changes requested by ${latest.reviewer}:\n${numbered(latest.changes)}`
+      : "No changes_requested verdict is on record for it.";
+    const summary =
+      reason.kind === "cap"
+        ? `${label(task)} reached ${task.round} review rounds without approval.`
+        : `${label(task)} has used all ${task.max_rounds} review rounds (its round budget) and asks for another review.\n\n${changeList}`;
     const gate = this.insertGate(
-      {
-        kind: "escalation",
-        task_id: id,
-        summary: `${label(task)} reached ${task.round} review rounds without approval.`,
-        links: task.artifacts.slice(-3),
-        requested_by: RELAY,
-      },
+      { kind: "escalation", task_id: id, summary, links: task.artifacts.slice(-3), requested_by: RELAY },
       now,
     );
+    const situation =
+      reason.kind === "cap"
+        ? `${label(task)} has had ${task.round} review rounds without approval.`
+        : `${label(task)} has used all ${task.max_rounds} review rounds and ${reason.requester} asks for another review.`;
     this.relayMessage(
       "human",
       "question",
-      `Escalation ${gate.id}: ${label(task)} has had ${task.round} review rounds without approval. ` +
+      `Escalation ${gate.id}: ${situation} ` +
         `Approve ${gate.id} to grant more rounds, or reject it to cancel the task (the orchestrator can then plan a narrower one).\n\n` +
-        `Latest changes requested by ${reviewer}:\n${numbered(changes)}`,
+        changeList,
       now,
       { task_id: id, on_behalf_of: "orchestrator", links: gate.links },
     );
     this.relayMessage(
       "orchestrator",
       "status",
-      `${label(task)} hit the review cap (${task.max_rounds} rounds) and was escalated to ${this.human()} as ${gate.id}.`,
+      reason.kind === "cap"
+        ? `${label(task)} hit the review cap (${task.max_rounds} rounds) and was escalated to ${this.human()} as ${gate.id}.`
+        : `${label(task)} has used all ${task.max_rounds} review rounds, so ${reason.requester}'s review_request was escalated to ${this.human()} as ${gate.id}.`,
       now,
       { task_id: id },
     );
@@ -954,28 +1117,44 @@ export class BuildDO extends DurableObject<Env> {
       this.relayMessage(
         task.assignee,
         "status",
-        `${id} escalated to ${this.human()} after round ${task.round}; wait for his decision.`,
+        `${id} escalated to ${this.human()} after round ${task.round}; wait for the decision.`,
         now,
         { task_id: id },
       );
     }
-    this.audit(RELAY, "task.escalated", id, { gate: gate.id, round: task.round }, now);
+    // A review_request past the budget still reached the reviewer: tell them not to answer it.
+    const reviewer = task.reviewer;
+    if (reason.kind !== "cap" && reviewer !== null && reviewer !== task.assignee && reviewer !== "orchestrator" && reviewer !== "human") {
+      this.relayMessage(
+        reviewer,
+        "status",
+        `${id} has used all ${task.max_rounds} review rounds, so its latest review_request went to ${this.human()} as ${gate.id}. Send no verdict on it; wait for the decision.`,
+        now,
+        { task_id: id },
+      );
+    }
+    this.audit(RELAY, "task.escalated", id, { gate: gate.id, round: task.round, reason: reason.kind }, now);
     return gate;
   }
 
-  private haltForCap(actor: Role): void {
+  /** An agent hit the message cap (send) or the ledger write cap (ledger_update, gate_request): halt the build. */
+  private haltForCap(actor: Role, cap: "message" | "write"): void {
     const now = Date.now();
     const build = this.loadBuild();
     if (build.status === "halted" || CLOSED_BUILD_STATUSES.includes(build.status)) return;
-    this.halt(build, "message cap reached", RELAY, now);
-    this.relayMessage(
-      "human",
-      "status",
-      `Build "${build.title}" (${build.build_id}) is halted: it reached its cap of ${build.max_messages} agent messages ` +
-        `(last attempt by ${actor}). Raise the cap with build_control set_caps, then resume it.`,
-      now,
-    );
+    const body =
+      cap === "message"
+        ? `it reached its cap of ${build.max_messages} agent messages (last attempt by ${actor}). ` +
+          `Raise the cap with build_control set_caps, then resume it.`
+        : `it reached its cap of ${this.writeCap(build)} agent ledger writes (ledger_update and gate_request, ` +
+          `3 × max_messages; last attempt by ${actor}). Raise max_messages with build_control set_caps, then resume it.`;
+    this.halt(build, cap === "message" ? "message cap reached" : "ledger write cap reached", RELAY, now);
+    this.relayMessage("human", "status", `Build ${JSON.stringify(build.title)} (${build.build_id}) is halted: ${body}`, now);
     this.saveBuild(build, now);
+  }
+
+  private writeCap(build: BuildRow): number {
+    return WRITE_CAP_FACTOR * build.max_messages;
   }
 
   // ---------------------------------------------------------------- ledger_update
@@ -985,7 +1164,7 @@ export class BuildDO extends DurableObject<Env> {
     const build = this.loadBuild();
     this.assertNotKilled(actor);
     this.assertWritable(build, actor);
-    this.recordWrite(actor, "ledger_update", now);
+    this.recordWrite(actor, build, "ledger_update", now);
     if (isAgent(actor)) this.answerNudges(actor);
     if (input.task_id === undefined) return { task: this.createTask(actor, build, input, now) };
 
@@ -997,6 +1176,9 @@ export class BuildDO extends DurableObject<Env> {
     this.checkLedgerPermission(actor, task, input, fields);
 
     const before = structuredClone(task);
+    const statuses = this.taskStatuses();
+    const wasWaiting = this.waitingOn(task, statuses).length > 0;
+    const target = this.nudgeTarget(task);
     if (input.title !== undefined) task.title = input.title;
     if (input.description !== undefined) task.description = input.description;
     if (input.depends_on !== undefined) task.depends_on = this.checkDependencies(input.depends_on, task.num);
@@ -1013,8 +1195,14 @@ export class BuildDO extends DurableObject<Env> {
     if (input.status !== undefined) this.applyStatus(task, input.status, now);
     if (input.links) this.addArtifacts(task, input.links, true);
     if (input.note !== undefined) this.addNote(task, actor, input.note, now);
-    // An update by the task's owner is activity on that task.
-    if (before.owner === actor) this.resetNudges(task, now);
+    // An update by the role the nudger watches for this task (its owner, or the assignee who owes the reviewer an
+    // answer) is activity on it, except while it stays blocked (its clock runs from when it became blocked).
+    // Entering or leaving blocked starts a new watch (DESIGN §8), and a task that becomes ready because a
+    // dependency was removed starts its idle clock now.
+    const staysBlocked = before.status === "blocked" && task.status === "blocked";
+    if (target === actor && !staysBlocked) this.resetNudges(task, now);
+    if ((before.status === "blocked") !== (task.status === "blocked")) this.resetNudges(task, now);
+    if (wasWaiting && this.waitingOn(task, statuses).length === 0) this.resetNudges(task, now);
     this.releaseEscalation(actor, before, task, now);
 
     this.commitTask(actor, before, task, now);
@@ -1025,8 +1213,12 @@ export class BuildDO extends DurableObject<Env> {
           ? `${label(task)} is done (marked done by ${actor}).`
           : `${label(task)} was cancelled by ${actor}${because(input.note)}`;
       this.taskClosed(actor, build, task, notice, now);
+    } else if (before.status === "cancelled" && task.status === "done") {
+      // Only done satisfies a dependency: the human turning a cancelled task into a done one releases its dependents.
+      this.releaseDependents(id, now);
     } else if (task.status === "blocked" && before.status !== "blocked" && before.owner === actor && actor !== "orchestrator") {
-      this.relayMessage("orchestrator", "status", `${id} is blocked (${actor})${because(input.note)}`, now, { task_id: id });
+      const note = input.note === undefined ? "" : ` Their note: ${quoted(input.note)}`;
+      this.notifyOrchestrator(task, "blocked", `${id} is blocked (${actor}).${note}`, now);
     }
     this.saveBuild(build, now);
     return { task: this.taskOut(task) };
@@ -1036,6 +1228,10 @@ export class BuildDO extends DurableObject<Env> {
     if (actor !== "orchestrator" && actor !== "human") fail("forbidden", "only the orchestrator or the human may create tasks");
     if (build.status !== "planning" && build.status !== "in_progress") {
       fail("conflict", `tasks can be created only while the build is planning or in_progress (it is ${build.status})`);
+    }
+    const tasks = this.count("SELECT COUNT(*) AS n FROM tasks");
+    if (tasks >= MAX_TASKS) {
+      fail("conflict", `build ${build.build_id} already has ${tasks} tasks, the most a build holds; update or reuse existing tasks`);
     }
     if (input.title === undefined || input.assignee === undefined) {
       fail("invalid_input", "creating a task needs title and assignee (pass task_id to update an existing task)");
@@ -1089,15 +1285,21 @@ export class BuildDO extends DurableObject<Env> {
       if (input.status === "in_review" || input.status === "changes_requested") {
         fail("forbidden", `${input.status} is set by review_request and verdict messages, not ledger_update`);
       }
-      // As the reviewer of a task in review, the orchestrator answers with a verdict like any reviewer.
-      if (input.status !== undefined && task.status === "in_review" && task.owner === actor) {
-        fail("conflict", `${id} is in review: answer it with a verdict`);
+      // A review ends with its reviewer's verdict; the orchestrator may only cancel the task meanwhile.
+      if (input.status !== undefined && input.status !== "cancelled" && task.status === "in_review") {
+        fail(
+          "conflict",
+          task.owner === actor
+            ? `${id} is in review: answer it with a verdict`
+            : `${id} is in review with ${task.reviewer}: its verdict moves it on (you may only cancel it)`,
+        );
       }
       if (input.status === "done") this.assertMayMarkDone(task);
-      if (input.reviewer !== undefined && (task.status === "in_review" || task.status === "changes_requested")) {
+      // Once a task has been reviewed its reviewer stays (only the human changes it), so no verdict is overridden.
+      if (input.reviewer !== undefined && task.round > 0) {
         const reviewer = input.reviewer === null ? null : this.roleArg("reviewer", input.reviewer);
         if (reviewer !== task.reviewer) {
-          fail("conflict", `${id} is ${task.status}: its reviewer can't change until the review loop ends`);
+          fail("conflict", `${id} has been reviewed (round ${task.round}): only ${this.human()} may change its reviewer`);
         }
       }
       return;
@@ -1168,11 +1370,44 @@ export class BuildDO extends DurableObject<Env> {
   }
 
   private checkDependencies(ids: string[], self: number | null): string[] {
-    for (const id of ids) {
+    const unique = [...new Set(ids)];
+    for (const id of unique) {
       if (self !== null && idNumber(id) === self) fail("invalid_input", `${id} cannot depend on itself`);
       this.loadTask(id);
     }
-    return [...new Set(ids)];
+    if (self !== null) {
+      const cycle = this.dependencyCycle(taskId(self), unique);
+      if (cycle) fail("invalid_input", `depends_on would create a cycle (${cycle.join(" -> ")}); a task can't wait on itself`);
+    }
+    return unique;
+  }
+
+  /** With `id` depending on `deps`, a path from `id` back to itself through the depends_on lists, or null. */
+  private dependencyCycle(id: string, deps: string[]): string[] | null {
+    const graph = new Map(
+      this.sql
+        .exec<{ num: number; depends_on: string }>("SELECT num, depends_on FROM tasks")
+        .toArray()
+        .map((row) => [taskId(row.num), parseJson<string[]>(row.depends_on, [])]),
+    );
+    graph.set(id, deps);
+    const seen = new Set<string>();
+    const path = [id];
+    const reaches = (from: string): boolean => {
+      for (const next of graph.get(from) ?? []) {
+        if (next === id) {
+          path.push(next);
+          return true;
+        }
+        if (seen.has(next)) continue;
+        seen.add(next);
+        path.push(next);
+        if (reaches(next)) return true;
+        path.pop();
+      }
+      return false;
+    };
+    return reaches(id) ? path : null;
   }
 
   private latestVerdict(id: string, round: number): VerdictValue | null {
@@ -1206,9 +1441,19 @@ export class BuildDO extends DurableObject<Env> {
     task.notes.push({ at: iso(now), by: actor, text });
   }
 
-  /** Counts an agent's ledger_update or gate_request against its write burst limit (BURST_PER_MINUTE × 3 per 60 s). */
-  private recordWrite(actor: Role, kind: "ledger_update" | "gate_request", now: number): void {
+  /**
+   * Counts an agent's ledger_update or gate_request toward the build's write cap (3 × max_messages; reaching it
+   * halts the build like the message cap) and its write burst limit (BURST_PER_MINUTE × 3 per 60 s).
+   */
+  private recordWrite(actor: Role, build: BuildRow, kind: "ledger_update" | "gate_request", now: number): void {
     if (!isAgent(actor)) return;
+    if (build.write_count >= this.writeCap(build)) {
+      fail(
+        "cap_reached",
+        `build ${build.build_id} reached its cap of ${this.writeCap(build)} agent ledger writes (ledger_update and ` +
+          `gate_request, 3 × max_messages); it is now halted and ${this.human()} has been told`,
+      );
+    }
     const limit = this.config.burstPerMinute * WRITE_BURST_FACTOR;
     const n = this.count("SELECT COUNT(*) AS n FROM writes WHERE role = ? AND at_ms > ?", actor, now - 60_000);
     if (n >= limit) {
@@ -1218,6 +1463,7 @@ export class BuildDO extends DurableObject<Env> {
       );
     }
     this.sql.exec("INSERT INTO writes (role, kind, at_ms) VALUES (?, ?, ?)", actor, kind, now);
+    build.write_count += 1;
     // Only the last minute matters for the limit, and the newest row of each kind for activity.
     this.sql.exec(
       "DELETE FROM writes WHERE at_ms <= ? AND seq NOT IN (SELECT MAX(seq) FROM writes GROUP BY role, kind)",
@@ -1229,24 +1475,67 @@ export class BuildDO extends DurableObject<Env> {
 
   /**
    * After a task closed (already saved): tasks waiting on it may now be ready, and the orchestrator is told
-   * unless it closed the task itself (DESIGN §6, orchestrator notices).
+   * unless it closed the task itself (DESIGN §6, orchestrator notices). The notice names what became ready, the
+   * open tasks a cancelled one still holds up, or the sign-off once every task is closed.
    */
   private taskClosed(actor: Role, build: BuildRow, task: TaskState, notice: string, now: number): void {
     const id = taskId(task.num);
-    this.releaseDependents(id, now);
-    if (actor !== "orchestrator") {
-      this.relayMessage("orchestrator", "status", notice + (this.isIdle(build) ? SIGNOFF_HINT : ""), now, { task_id: id });
+    const ready = this.releaseDependents(id, now);
+    if (actor === "orchestrator") return;
+    let body = notice;
+    if (task.status === "cancelled") {
+      const dependents = this.loadTasks(`WHERE ${OPEN_TASK} ORDER BY num`)
+        .filter((other) => other.depends_on.includes(id))
+        .map((other) => taskId(other.num));
+      if (dependents.length === 1) {
+        body += ` ${dependents[0]} depends on it: update ${dependents[0]}'s depends_on or cancel ${dependents[0]}.`;
+      } else if (dependents.length > 1) {
+        body += ` ${joined(dependents)} depend on it: update their depends_on or cancel them.`;
+      }
     }
+    if (ready.length > 0) {
+      body += ` Now ready: ${ready.map((other) => `${label(other)} (${other.owner ?? "no owner"}, ${other.status})`).join("; ")}.`;
+    } else if (this.allClosed(build)) {
+      body += SIGNOFF_HINT;
+    }
+    if (task.status === "done") this.notifyOrchestrator(task, "done", body, now);
+    else this.relayMessage("orchestrator", "status", body, now, { task_id: id });
   }
 
-  /** A task whose last open dependency just closed becomes ready: its idle clock starts now. */
-  private releaseDependents(closedId: string, now: number): void {
+  /**
+   * A done or blocked notice about a task to the orchestrator: at most one of each kind per task per
+   * NUDGE_AFTER_MINUTES (DESIGN §6), so a done/reopen or blocked/unblocked loop can't flood it. A later one within
+   * the window is only recorded in the audit (`notice.suppressed`).
+   */
+  private notifyOrchestrator(task: TaskState, kind: "done" | "blocked", body: string, now: number): void {
+    const id = taskId(task.num);
+    const last = this.sql
+      .exec<{ at_ms: number }>("SELECT at_ms FROM notices WHERE task_num = ? AND kind = ?", task.num, kind)
+      .toArray()[0];
+    if (last && now - last.at_ms < this.config.nudgeAfterMs) {
+      this.audit(RELAY, "notice.suppressed", id, { kind, body, last_sent_at: iso(last.at_ms) }, now);
+      return;
+    }
+    this.sql.exec(
+      "INSERT INTO notices (task_num, kind, at_ms) VALUES (?, ?, ?) ON CONFLICT (task_num, kind) DO UPDATE SET at_ms = excluded.at_ms",
+      task.num,
+      kind,
+      now,
+    );
+    this.relayMessage("orchestrator", "status", body, now, { task_id: id });
+  }
+
+  /** Tasks whose last unfinished dependency just closed become ready: their idle clocks start now. Returns them. */
+  private releaseDependents(closedId: string, now: number): TaskState[] {
     const statuses = this.taskStatuses();
+    const ready: TaskState[] = [];
     for (const task of this.loadTasks(`WHERE ${OPEN_TASK} ORDER BY num`)) {
       if (!task.depends_on.includes(closedId) || this.waitingOn(task, statuses).length > 0) continue;
       this.resetNudges(task, now);
       this.saveTask(task, now);
+      ready.push(task);
     }
+    return ready;
   }
 
   /** An escalated task that is closed or leaves blocked by another route drops its pending escalation gate. */
@@ -1285,7 +1574,7 @@ export class BuildDO extends DurableObject<Env> {
     const build = this.loadBuild();
     this.assertNotKilled(actor);
     this.assertWritable(build, actor);
-    this.recordWrite(actor, "gate_request", now);
+    this.recordWrite(actor, build, "gate_request", now);
     const plan = input.kind === "plan_approval";
     if (plan) {
       if (build.status !== "planning") {
@@ -1324,7 +1613,7 @@ export class BuildDO extends DurableObject<Env> {
       this.relayMessage(
         "human",
         "question",
-        `${displayName(actor, this.config)} requests ${GATE_LABELS[input.kind]} (${gate.id}) for "${build.title}". ` +
+        `${displayName(actor, this.config)} requests ${GATE_LABELS[input.kind]} (${gate.id}) for ${JSON.stringify(build.title)}. ` +
           `Approve or reject it with gate_decide or on the ledger page.\n\n${input.summary}`,
         now,
         { links, on_behalf_of: actor === "human" ? null : actor },
@@ -1377,7 +1666,12 @@ export class BuildDO extends DurableObject<Env> {
       if (row.task_id === null) fail("conflict", `escalation ${gateId} has no task`);
       task = this.loadTask(row.task_id);
       if (task.status !== "blocked" || !task.escalated) {
-        // The task moved on by another route; the gate no longer applies.
+        // The task moved on by another route; the gate no longer applies (nor does the escalated flag).
+        if (task.escalated) {
+          const before = structuredClone(task);
+          task.escalated = false;
+          this.commitTask(actor, before, task, now);
+        }
         this.sql.exec("UPDATE gates SET status = 'cancelled' WHERE num = ?", row.num);
         this.audit(actor, "gate.cancelled", gateId, { kind: "escalation", task_id: row.task_id, task_status: task.status }, now);
         this.saveBuild(build, now);
@@ -1494,6 +1788,12 @@ export class BuildDO extends DurableObject<Env> {
         if (build.message_count >= build.max_messages) {
           fail("conflict", `build ${build.build_id} is at its message cap (${build.max_messages}); raise it with set_caps first`);
         }
+        if (build.write_count >= this.writeCap(build)) {
+          fail(
+            "conflict",
+            `build ${build.build_id} is at its ledger write cap (${this.writeCap(build)}, 3 × max_messages); raise max_messages with set_caps first`,
+          );
+        }
         const target = build.status_before_halt ?? "planning";
         const reason = build.halt_reason ?? "no reason given";
         build.status = target;
@@ -1519,9 +1819,10 @@ export class BuildDO extends DurableObject<Env> {
         }
         if (caps.max_messages !== undefined) build.max_messages = caps.max_messages;
         if (caps.max_review_rounds !== undefined) {
-          // Open tasks keep any extra rounds the human granted on top of the build cap.
+          // Open tasks keep any extra rounds the human granted on top of the build cap, and never drop below the
+          // round they are in (a review_request past the budget escalates; DESIGN §6).
           const delta = caps.max_review_rounds - build.max_review_rounds;
-          this.sql.exec(`UPDATE tasks SET max_rounds = MAX(1, max_rounds + ?) WHERE ${OPEN_TASK}`, delta);
+          this.sql.exec(`UPDATE tasks SET max_rounds = MAX(1, round, max_rounds + ?) WHERE ${OPEN_TASK}`, delta);
           build.max_review_rounds = caps.max_review_rounds;
         }
         this.audit(
@@ -1646,10 +1947,16 @@ export class BuildDO extends DurableObject<Env> {
   // ---------------------------------------------------------------- nudges
 
   /**
-   * What the nudger watches (DESIGN §8), with the next due time of each. A task: build in_progress, task open
-   * and ready, owned by an agent role; due once the task AND its owner (any send or ledger_update in this
-   * build) have been idle for NUDGE_AFTER_MINUTES. The idle build (in_progress, no open task, no pending gate)
-   * is watched the same way for the orchestrator.
+   * What the nudger watches (DESIGN §8), with the next due time of each. Only in an in_progress build, and only
+   * open, ready tasks held by an agent:
+   * - a blocked task: its owner waits on someone else, so it is not nudged; once the task has been blocked for
+   *   NUDGE_AFTER_MINUTES the orchestrator is told, and the human after another interval;
+   * - a task in review whose reviewer's latest message on it is a question to the assignee that the assignee
+   *   hasn't answered: the assignee owes the next step, so it is the one nudged;
+   * - any other task: its owner (for a task in review, the reviewer), once the task AND that role (any send or
+   *   ledger_update in this build) have been idle for NUDGE_AFTER_MINUTES.
+   * The idle build (in_progress, no ready open task held by an agent, no pending gate) is watched the same way
+   * for the orchestrator.
    */
   private nudgePlan(build: BuildRow): NudgeItem[] {
     if (build.status !== "in_progress") return [];
@@ -1657,74 +1964,177 @@ export class BuildDO extends DurableObject<Env> {
     const activity = this.lastWrites();
     const statuses = this.taskStatuses();
     const plan: NudgeItem[] = [];
-    const watch = (task: TaskState | null, owner: Role, count: number, lastNudge: number | null, since: number) => {
-      if (count >= 2) return; // escalated; nothing more until the owner writes again
-      const idleSince = Math.max(since, activity.get(owner) ?? 0);
+    const watch = (
+      task: TaskState | null,
+      kind: NudgeKind,
+      target: Role,
+      count: number,
+      lastNudge: number | null,
+      since: number,
+    ) => {
+      if (count >= 2) return; // escalated; nothing more until there is activity
+      // A blocked task's clock is the task's own: its owner's writes elsewhere don't make it less stuck.
+      const idleSince = kind === "blocked" ? since : Math.max(since, activity.get(target) ?? 0);
       const due = count === 0 || lastNudge === null ? idleSince + after : lastNudge + after;
-      plan.push({ task, owner, step: count === 0 ? 1 : 2, due, idleSince });
+      plan.push({ task, kind, target, step: count === 0 ? 1 : 2, due, idleSince });
     };
     for (const task of this.loadTasks(`WHERE ${WATCHED_TASK} ORDER BY num`)) {
       if (this.waitingOn(task, statuses).length > 0) continue;
-      watch(task, task.owner as Role, task.nudge_count, task.last_nudge_ms, task.last_activity_ms);
+      if (task.status === "blocked") {
+        watch(task, "blocked", "orchestrator", task.nudge_count, task.last_nudge_ms, task.last_activity_ms);
+        continue;
+      }
+      const target = this.nudgeTarget(task);
+      if (target === null || target === "human") continue; // an answer the human owes is never nudged
+      const kind: NudgeKind = target !== task.owner ? "answer" : task.status === "in_review" ? "review" : "idle";
+      watch(task, kind, target, task.nudge_count, task.last_nudge_ms, task.last_activity_ms);
     }
     const local = this.localState();
     if (local.idle_since_ms !== null) {
-      watch(null, "orchestrator", local.idle_nudge_count, local.idle_last_nudge_ms, local.idle_since_ms);
+      watch(null, "idle", "orchestrator", local.idle_nudge_count, local.idle_last_nudge_ms, local.idle_since_ms);
     }
     return plan;
+  }
+
+  /**
+   * Whom the nudger watches for a task: its owner, except for a task in review whose reviewer's latest message on
+   * it is a question to the assignee that the assignee hasn't answered (no message from it on the task since).
+   */
+  private nudgeTarget(task: TaskState): Role | null {
+    if (task.status !== "in_review" || task.owner === null) return task.owner;
+    const id = taskId(task.num);
+    const latest = this.sql
+      .exec<{ seq: number; type: MessageType; to_role: Role }>(
+        "SELECT seq, type, to_role FROM messages WHERE task_id = ? AND from_role = ? ORDER BY seq DESC LIMIT 1",
+        id,
+        task.owner,
+      )
+      .toArray()[0];
+    if (!latest || latest.type !== "question" || latest.to_role !== task.assignee) return task.owner;
+    const answered = this.count(
+      "SELECT COUNT(*) AS n FROM messages WHERE task_id = ? AND from_role = ? AND seq > ?",
+      id,
+      task.assignee,
+      latest.seq,
+    );
+    return answered > 0 ? task.owner : task.assignee;
   }
 
   private processNudges(now: number): void {
     const build = this.loadBuild();
     const due = this.nudgePlan(build).filter((item) => item.due <= now);
     if (due.length === 0) return;
-    // One message per owner and step, listing every task of that owner that is due.
+    // One message per target and step, listing every task of that target that is due; a blocked task's notice
+    // and the idle build's nudge stand alone.
     const groups = new Map<string, NudgeItem[]>();
     for (const item of due) {
-      const key = `${item.task ? item.owner : "build"}:${item.step}`;
+      const key = item.task === null ? "build" : item.kind === "blocked" ? `blocked:${item.task.num}` : `${item.target}:${item.step}`;
       groups.set(key, [...(groups.get(key) ?? []), item]);
     }
     for (const items of groups.values()) {
       const [first] = items as [NudgeItem, ...NudgeItem[]];
       if (first.task === null) this.nudgeIdleBuild(build, first, now);
-      else if (first.step === 1) this.nudgeOwner(first.owner, items.map((item) => item.task as TaskState), now);
-      else this.reportStalled(first.owner, items.map((item) => item.task as TaskState), now);
+      else if (first.kind === "blocked") this.reportBlocked(first.task, first.step, now);
+      else if (first.step === 1) this.nudgeOwner(first.target, items, now);
+      else this.reportStalled(first.target, items.map((item) => item.task as TaskState), now);
     }
     this.saveBuild(build, now);
   }
 
-  private nudgeOwner(owner: Role, tasks: TaskState[], now: number): void {
+  private nudgeOwner(target: Role, items: NudgeItem[], now: number): void {
+    const tasks = items.map((item) => item.task as TaskState);
     const [first] = tasks as [TaskState, ...TaskState[]];
-    const idle = (task: TaskState) => formatDuration(now - task.last_activity_ms);
-    let body: string;
-    let copy: string;
-    if (tasks.length === 1) {
-      body =
-        `Nudge: ${label(first)} has been idle for ${idle(first)}. You own it (status ${first.status}): post progress with ` +
-        `send (type status), update it with ledger_update, or hand it off.`;
-      copy = `Nudged ${owner}: ${label(first)} has been idle for ${idle(first)}.`;
-    } else {
-      const list = tasks.map((task) => `${label(task)} (${task.status}, idle ${idle(task)})`).join("; ");
-      body =
-        `Nudge: you own ${tasks.length} idle tasks: ${list}. Post progress with send (type status), update them with ` +
-        `ledger_update, or hand them off.`;
-      copy = `Nudged ${owner} about ${tasks.length} idle tasks: ${list}.`;
-    }
+    const { body, copy } = items.length === 1 ? this.nudgeText(target, items[0] as NudgeItem, now) : this.groupNudgeText(target, items, now);
     const id = taskId(first.num);
-    this.relayMessage(owner, "status", body, now, { task_id: id, on_behalf_of: "orchestrator" });
-    if (owner !== "orchestrator") this.relayMessage("orchestrator", "status", copy, now, { task_id: id });
+    this.relayMessage(target, "status", body, now, { task_id: id, on_behalf_of: "orchestrator" });
+    if (target !== "orchestrator") this.relayMessage("orchestrator", "status", copy, now, { task_id: id });
     for (const task of tasks) {
       task.nudge_count = 1;
       task.last_nudge_ms = now;
       this.saveTask(task, now);
-      this.audit(RELAY, "nudge.sent", taskId(task.num), { owner }, now);
+      this.audit(RELAY, "nudge.sent", taskId(task.num), { owner: target }, now);
     }
   }
 
-  private reportStalled(owner: Role, tasks: TaskState[], now: number): void {
+  /** The nudge about one task, worded by why it is watched (DESIGN §8), and the orchestrator's copy. */
+  private nudgeText(target: Role, item: NudgeItem, now: number): { body: string; copy: string } {
+    const task = item.task as TaskState;
+    const idle = formatDuration(now - task.last_activity_ms);
+    switch (item.kind) {
+      case "review":
+        return {
+          body:
+            `Nudge: ${label(task)} has been waiting on your review for ${idle}. Send your verdict to ${task.assignee} ` +
+            `(or a question if a link won't open).`,
+          copy: `Nudged ${target}: ${label(task)} has been waiting on its review for ${idle}.`,
+        };
+      case "answer":
+        return {
+          body:
+            `Nudge: ${task.owner} asked you about ${label(task)} ${idle} ago and is waiting on your answer to review it. ` +
+            `Reply to ${task.owner} with send (task_id ${taskId(task.num)}), e.g. a status with a working link.`,
+          copy: `Nudged ${target}: ${task.owner} has been waiting ${idle} for its answer about ${label(task)}.`,
+        };
+      default:
+        return {
+          body:
+            `Nudge: ${label(task)} has been idle for ${idle}. You own it (status ${task.status}): ` +
+            (target === "orchestrator"
+              ? "act on it, or record where it stands with a ledger_update note."
+              : "post progress with send (type status), update it with ledger_update, or hand it off."),
+          copy: `Nudged ${target}: ${label(task)} has been idle for ${idle}.`,
+        };
+    }
+  }
+
+  /** One nudge listing several tasks, each worded by why it is watched, and the orchestrator's copy. */
+  private groupNudgeText(target: Role, items: NudgeItem[], now: number): { body: string; copy: string } {
+    const entry = (item: NudgeItem) => {
+      const task = item.task as TaskState;
+      const idle = formatDuration(now - task.last_activity_ms);
+      if (item.kind === "review") return `${label(task)} (in_review, waiting on your review for ${idle})`;
+      if (item.kind === "answer") return `${label(task)} (in_review, ${task.owner} waiting on your answer for ${idle})`;
+      return `${label(task)} (${task.status}, idle ${idle})`;
+    };
+    const list = items.map(entry).join("; ");
+    const orchestrator = target === "orchestrator";
+    const idleIds = items.filter((item) => item.kind === "idle").map((item) => taskId((item.task as TaskState).num));
+    if (idleIds.length === items.length) {
+      const moves = orchestrator
+        ? "Act on them, or record where they stand with ledger_update notes."
+        : "Post progress with send (type status), update them with ledger_update, or hand them off.";
+      return {
+        body: `Nudge: you own ${items.length} idle tasks: ${list}. ${moves}`,
+        copy: `Nudged ${target} about ${items.length} idle tasks: ${list}.`,
+      };
+    }
+    const moves: string[] = [];
+    if (idleIds.length > 0) {
+      const it = plural(idleIds.length, "it", "them");
+      moves.push(
+        orchestrator
+          ? `${joined(idleIds)}: act on ${it}, or record where ${plural(idleIds.length, "it stands", "they stand")} with a ledger_update note.`
+          : `${joined(idleIds)}: post progress with send (type status), update ${it} with ledger_update, or hand ${it} off.`,
+      );
+    }
+    for (const item of items) {
+      const task = item.task as TaskState;
+      if (item.kind === "review") {
+        moves.push(`${taskId(task.num)}: send your verdict to ${task.assignee} (or a question if a link won't open).`);
+      } else if (item.kind === "answer") {
+        moves.push(`${taskId(task.num)}: reply to ${task.owner}'s question with send.`);
+      }
+    }
+    return {
+      body: `Nudge: ${items.length} tasks are waiting on you: ${list}. ${moves.join(" ")}`,
+      copy: `Nudged ${target} about ${items.length} tasks: ${list}.`,
+    };
+  }
+
+  private reportStalled(target: Role, tasks: TaskState[], now: number): void {
     const [first] = tasks as [TaskState, ...TaskState[]];
     const idle = formatDuration(now - Math.min(...tasks.map((task) => task.last_activity_ms)));
-    const body = `Stalled: ${owner} missed two nudges on ${tasks.map(label).join(", ")} (idle for ${idle}).`;
+    const body = `Stalled: ${target} missed two nudges on ${tasks.map(label).join(", ")} (idle for ${idle}).`;
     const id = taskId(first.num);
     this.relayMessage("human", "status", body, now, { task_id: id, on_behalf_of: "orchestrator" });
     this.relayMessage("orchestrator", "status", body, now, { task_id: id });
@@ -1732,34 +2142,99 @@ export class BuildDO extends DurableObject<Env> {
       task.nudge_count = 2;
       task.stalled = true;
       this.saveTask(task, now);
-      this.audit(RELAY, "nudge.escalated", taskId(task.num), { owner }, now);
+      this.audit(RELAY, "nudge.escalated", taskId(task.num), { owner: target }, now);
     }
   }
 
-  /** The backstop for final sign-off: an in_progress build with no open task and no pending gate. */
+  /**
+   * A blocked task's watch (DESIGN §8): after NUDGE_AFTER_MINUTES the orchestrator (who can unblock it) is told,
+   * after another interval the human. The owner's latest note is quoted as its own words.
+   */
+  private reportBlocked(task: TaskState, step: 1 | 2, now: number): void {
+    const id = taskId(task.num);
+    const owner = task.owner as Role;
+    const blockedFor = formatDuration(now - task.last_activity_ms);
+    const latest = task.notes.filter((note) => note.by === owner).at(-1);
+    const note = latest ? ` Their note: ${quoted(latest.text)}` : "";
+    if (step === 1) {
+      this.relayMessage("orchestrator", "status", `${label(task)} has been blocked for ${blockedFor} (${owner}).${note}`, now, {
+        task_id: id,
+      });
+      task.nudge_count = 1;
+      task.last_nudge_ms = now;
+      this.saveTask(task, now);
+      this.audit(RELAY, "nudge.sent", id, { owner, reason: "blocked" }, now);
+      return;
+    }
+    const body = `Stalled: ${id} blocked for ${blockedFor} (${JSON.stringify(task.title)}, ${owner}).${note}`;
+    this.relayMessage("human", "status", body, now, { task_id: id, on_behalf_of: "orchestrator" });
+    this.relayMessage("orchestrator", "status", body, now, { task_id: id });
+    task.nudge_count = 2;
+    task.stalled = true;
+    this.saveTask(task, now);
+    this.audit(RELAY, "nudge.escalated", id, { owner, reason: "blocked" }, now);
+  }
+
+  /**
+   * The backstop for an in_progress build where no agent has anything ready to work on (no ready open task held
+   * by an agent) and no gate is pending: every task closed (final sign-off is next), or the rest waiting on
+   * dependencies or with the human.
+   */
   private nudgeIdleBuild(build: BuildRow, item: NudgeItem, now: number): void {
     const idle = formatDuration(now - item.idleSince);
+    const open = this.loadTasks(`WHERE ${OPEN_TASK} ORDER BY num`);
+    const title = JSON.stringify(build.title);
     if (item.step === 1) {
-      this.relayMessage("orchestrator", "status", `No open tasks for ${idle}: request final_signoff or add tasks.`, now);
+      const body =
+        open.length === 0
+          ? `No open tasks for ${idle}: request final_signoff or add tasks.`
+          : `Nothing to work on for ${idle}: no agent holds a ready open task (${this.describeOpen(open)}). ` +
+            `Assign ready work, fix depends_on, or cancel what is no longer needed.`;
+      this.relayMessage("orchestrator", "status", body, now);
       this.sql.exec("UPDATE local_state SET idle_nudge_count = 1, idle_last_nudge_ms = ?", now);
-      this.audit(RELAY, "nudge.sent", build.build_id, { owner: "orchestrator", reason: "no open tasks" }, now);
+      this.audit(RELAY, "nudge.sent", build.build_id, { owner: "orchestrator", reason: open.length === 0 ? "no open tasks" : "nothing ready" }, now);
       return;
     }
     const body =
-      `Stalled: orchestrator missed two nudges on "${build.title}": no open tasks for ${idle} ` +
-      `and final sign-off not requested.`;
+      open.length === 0
+        ? `Stalled: orchestrator missed two nudges on ${title}: no open tasks for ${idle} and final sign-off not requested.`
+        : `Stalled: orchestrator missed two nudges on ${title}: no agent has had a ready task for ${idle}.`;
     this.relayMessage("human", "status", body, now);
     this.relayMessage("orchestrator", "status", body, now);
     this.sql.exec("UPDATE local_state SET idle_nudge_count = 2");
-    this.audit(RELAY, "nudge.escalated", build.build_id, { owner: "orchestrator", reason: "no open tasks" }, now);
+    this.audit(RELAY, "nudge.escalated", build.build_id, { owner: "orchestrator", reason: open.length === 0 ? "no open tasks" : "nothing ready" }, now);
   }
 
-  /** Any send or ledger_update by an agent answers the nudges about what it owns (the idle build is the orchestrator's). */
+  /** Why no open task is workable, e.g. `T2 "Ship" waits on T1 (cancelled); T3 "Copy" is with James`. */
+  private describeOpen(open: TaskState[]): string {
+    const statuses = this.taskStatuses();
+    const parts = open.slice(0, LISTED_TASKS).map((task) => {
+      const waiting = this.waitingOn(task, statuses);
+      if (waiting.length > 0) {
+        const ids = waiting.map((id) => (statuses.get(id) === "cancelled" ? `${id} (cancelled)` : id));
+        return `${label(task)} waits on ${ids.join(", ")}`;
+      }
+      return task.owner === "human" ? `${label(task)} is with ${this.human()}` : `${label(task)} has no owner`;
+    });
+    if (open.length > LISTED_TASKS) parts.push(`${open.length - LISTED_TASKS} more`);
+    return parts.join("; ");
+  }
+
+  /**
+   * Any send or ledger_update by an agent answers the nudges it was sent (DESIGN §8): those about the tasks it
+   * owns (not blocked ones: their watch waits on someone else), about a review whose answer it owes, and the
+   * idle build's (the orchestrator's).
+   */
   private answerNudges(actor: Role): void {
     this.sql.exec(
-      "UPDATE tasks SET nudge_count = 0, last_nudge_ms = NULL, stalled = 0 WHERE owner = ? AND nudge_count > 0",
+      "UPDATE tasks SET nudge_count = 0, last_nudge_ms = NULL, stalled = 0 WHERE owner = ? AND nudge_count > 0 AND status NOT IN ('blocked', 'in_review')",
       actor,
     );
+    for (const task of this.loadTasks("WHERE status = 'in_review' AND nudge_count > 0 AND (owner = ? OR assignee = ?)", actor, actor)) {
+      if (this.nudgeTarget(task) === actor) {
+        this.sql.exec("UPDATE tasks SET nudge_count = 0, last_nudge_ms = NULL, stalled = 0 WHERE num = ?", task.num);
+      }
+    }
     if (actor === "orchestrator") this.sql.exec("UPDATE local_state SET idle_nudge_count = 0, idle_last_nudge_ms = NULL");
   }
 
@@ -1777,13 +2252,24 @@ export class BuildDO extends DurableObject<Env> {
     return new Map(rows.map((row) => [row.role, row.at]));
   }
 
-  /** In progress with no open task and no pending gate: the orchestrator's move (final sign-off or more tasks). */
-  private isIdle(build: BuildRow): boolean {
+  /** In progress with every task closed and no pending gate: final sign-off is the orchestrator's next move. */
+  private allClosed(build: BuildRow): boolean {
     return (
       build.status === "in_progress" &&
       this.count(`SELECT COUNT(*) AS n FROM tasks WHERE ${OPEN_TASK}`) === 0 &&
       this.count("SELECT COUNT(*) AS n FROM gates WHERE status = 'pending'") === 0
     );
+  }
+
+  /**
+   * In progress with no ready open task held by an agent and no pending gate: nobody has anything to work on, so
+   * the orchestrator's move (final sign-off, more tasks, or fixing what holds the rest up).
+   */
+  private isIdle(build: BuildRow): boolean {
+    if (build.status !== "in_progress") return false;
+    if (this.count("SELECT COUNT(*) AS n FROM gates WHERE status = 'pending'") > 0) return false;
+    const statuses = this.taskStatuses();
+    return !this.loadTasks(`WHERE ${AGENT_TASK}`).some((task) => this.waitingOn(task, statuses).length === 0);
   }
 
   /** Starts or stops the idle-build watch (DESIGN §8) after every change to the build. */
@@ -1827,13 +2313,14 @@ export class BuildDO extends DurableObject<Env> {
     build.updated_ms = now;
     this.sql.exec(
       `UPDATE build SET status = ?, status_before_halt = ?, halt_reason = ?, max_messages = ?, max_review_rounds = ?,
-         message_count = ?, rev = ?, updated_ms = ?`,
+         message_count = ?, write_count = ?, rev = ?, updated_ms = ?`,
       build.status,
       build.status_before_halt,
       build.halt_reason,
       build.max_messages,
       build.max_review_rounds,
       build.message_count,
+      build.write_count,
       build.rev,
       build.updated_ms,
     );
@@ -1848,7 +2335,7 @@ export class BuildDO extends DurableObject<Env> {
     }
   }
 
-  /** The global kill switch as RelayDO last pushed it, checked inside the write's own transaction (DESIGN §7). */
+  /** This build's copy of the global kill switch, checked inside the write's own transaction (DESIGN §7). */
   private assertNotKilled(actor: Role): void {
     if (!isAgent(actor)) return;
     const state = this.localState();
@@ -1906,12 +2393,9 @@ export class BuildDO extends DurableObject<Env> {
     return new Map(rows.map((row) => [taskId(row.num), row.status]));
   }
 
-  /** The task's depends_on tasks that are not done or cancelled yet. */
+  /** The task's depends_on tasks that are not done: a cancelled dependency keeps it waiting (DESIGN §5). */
   private waitingOn(task: TaskState, statuses: Map<string, TaskStatus>): string[] {
-    return task.depends_on.filter((id) => {
-      const status = statuses.get(id);
-      return status === undefined || !isClosed(status);
-    });
+    return task.depends_on.filter((id) => statuses.get(id) !== "done");
   }
 
   private assertTaskOpen(task: TaskState): void {
@@ -2047,6 +2531,7 @@ export class BuildDO extends DurableObject<Env> {
       gates: { plan_approval: row.gate_plan_approval === 1, final_signoff: row.gate_final_signoff === 1 },
       caps: { max_messages: row.max_messages, max_review_rounds: row.max_review_rounds },
       message_count: row.message_count,
+      write_count: row.write_count,
       created_by: row.created_by,
       created_at: iso(row.created_ms),
       updated_at: iso(row.updated_ms),

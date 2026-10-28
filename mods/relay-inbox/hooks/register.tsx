@@ -3,7 +3,7 @@ import type { On, Register, Timer } from 'claude-code'
 
 import type { RelayInbox, RelayMemory } from '../types'
 import { Inbox, type InboxHost } from './inbox'
-import { bandLine, formatForModel } from './messages'
+import { bandLine } from './messages'
 import { type RelayConfig, errorText, readConfig } from './relay'
 
 /** How often the mod's wake check runs (the start's grace ending, a wake whose turn never started). */
@@ -12,8 +12,9 @@ const TICK_MS = 5_000
 const EMPTY_INBOX: RelayInbox = { role: null, unread: [], builds: [], halted: null, health: { kind: 'starting' } }
 const EMPTY_MEMORY: RelayMemory = { woken: [], recent: [], lastWakeAt: 0 }
 // Change a tag when that value's fields change: it declines what an earlier version stored.
-const inboxState = atom({ plugin: 'relay-inbox', key: 'inbox' } as const, EMPTY_INBOX, { shape: 'inbox-1' })
-const memoryState = atom({ plugin: 'relay-inbox', key: 'memory' } as const, EMPTY_MEMORY, { shape: 'memory-2' })
+// Both hold RelayMessage, which gained `seq` and `next_task_id` in 0.3.0.
+const inboxState = atom({ plugin: 'relay-inbox', key: 'inbox' } as const, EMPTY_INBOX, { shape: 'inbox-2' })
+const memoryState = atom({ plugin: 'relay-inbox', key: 'memory' } as const, EMPTY_MEMORY, { shape: 'memory-3' })
 
 export const register: Register = (on, options) => {
   // Like a missing required field, an unusable value fails the load with a reason the person sees.
@@ -86,20 +87,19 @@ function registerInbox(on: On, config: RelayConfig, autoWake: boolean): void {
     return next(e)
   })
 
+  // A model request of a main-loop turn carries every row the Mod added to the conversation before it.
+  on('turn.step', async function* ($, e, next) {
+    if (e.agentId === undefined) inbox.stepped()
+    return yield* next(e)
+  })
+
   // Unread messages ride along with a prompt that starts a turn: the prompt reads them (marking them
   // read) and carries exactly what that read returned. A slash command, or a prompt typed over a
   // running turn, carries nothing: that turn's own inbox calls cover it.
   on('prompt.submit', async ($, e, next) => {
     const engine = host
     if (e.command !== undefined || e.turnId !== undefined || engine === undefined) return next(e)
-    const taken = await inbox.take(engine)
-    if (taken === undefined) return next(e)
-    const block = formatForModel(taken.messages, taken.builds, taken.role, taken.halted)
-    const result = await next({ ...e, context: [...(e.context ?? []), block] })
-    // They are read on the relay either way: a prompt that did not enter hands them over as a row.
-    if (result.drop !== undefined) inbox.background(engine, () => inbox.handOver(engine, taken))
-    else await inbox.delivered(engine, taken.messages)
-    return result
+    return inbox.carry(engine, blocks => next(blocks.length === 0 ? e : { ...e, context: [...(e.context ?? []), ...blocks] }))
   })
 
   on('command.run', { command: 'relay' }, async () =>

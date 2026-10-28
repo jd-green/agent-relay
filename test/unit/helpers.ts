@@ -119,7 +119,8 @@ export function runAlarm(buildId: string): Promise<boolean> {
 
 /**
  * Lets time pass in a build by moving every clock back: task idle and nudge times, when each role last wrote
- * (messages and ledger writes) and the idle-build watch. No test-only code paths in the Worker.
+ * (messages and ledger writes), when each task last caused a notice, and the idle-build watch. No test-only
+ * code paths in the Worker.
  */
 export function timeTravel(buildId: string, minutes: number) {
   const shift = minutes * 60_000;
@@ -128,6 +129,7 @@ export function timeTravel(buildId: string, minutes: number) {
     sql.exec("UPDATE tasks SET last_activity_ms = last_activity_ms - ?, last_nudge_ms = last_nudge_ms - ?", shift, shift);
     sql.exec("UPDATE messages SET created_ms = created_ms - ?", shift);
     sql.exec("UPDATE writes SET at_ms = at_ms - ?", shift);
+    sql.exec("UPDATE notices SET at_ms = at_ms - ?", shift);
     sql.exec(
       "UPDATE local_state SET idle_since_ms = idle_since_ms - ?, idle_last_nudge_ms = idle_last_nudge_ms - ?",
       shift,

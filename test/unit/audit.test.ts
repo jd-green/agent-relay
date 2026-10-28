@@ -48,8 +48,8 @@ describe("audit", () => {
     const rows = (await relaySql("SELECT actor, action, target, detail FROM audit ORDER BY seq")) as Json[];
     expect(rows).toEqual([
       { actor: "human", action: "build.created", target: buildId, detail: JSON.stringify({ title: "Tip calculator" }) },
-      { actor: "human", action: "kill_switch.on", target: null, detail: JSON.stringify({ reason: "Stop" }) },
-      { actor: "human", action: "kill_switch.off", target: null, detail: JSON.stringify({ reason: null }) },
+      { actor: "human", action: "kill_switch.on", target: null, detail: JSON.stringify({ reason: "Stop", epoch: 1 }) },
+      { actor: "human", action: "kill_switch.off", target: null, detail: JSON.stringify({ reason: null, epoch: 2 }) },
     ]);
   });
 });

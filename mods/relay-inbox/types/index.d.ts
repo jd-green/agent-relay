@@ -1,11 +1,15 @@
 /** A message as the relay's inbox tool returns it (docs/DESIGN.md section 6). */
 export type RelayMessage = {
   id: string
+  /** The message's position in its build (`M<seq>`): `inbox {since}` lists from it. `null` when the relay left it out. */
+  seq: number | null
   build_id: string
   from: string
   to: string
   type: string
   task_id: string | null
+  /** On a finishing handoff: the task the recipient continues on (its `task_id` is the sender's finished task). */
+  next_task_id: string | null
   body: string
   links: { url: string; label?: string }[]
   verdict: string | null

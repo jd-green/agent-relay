@@ -1,6 +1,6 @@
 {
   "name": "relay-inbox",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Agent Relay inbox: polls the relay for this role's unread messages, shows them in a band above the prompt with Read and Reply, hands them to the model on the next turn, and wakes an idle session when new ones arrive.",
   "author": { "name": "James Green" },
   "types": "./types/index.d.ts",

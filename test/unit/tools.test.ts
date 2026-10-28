@@ -194,6 +194,30 @@ describe("build_list", () => {
     expect(((await buildSql(buildId, "SELECT summary_dirty FROM local_state")) as Json[])[0].summary_dirty).toBe(0);
     await createBuild({ title: "Next" });
   });
+
+  it("keeps retrying from the alarm while RelayDO can't even be read", async () => {
+    const { buildId } = await inProgressBuild();
+    await relaySql("ALTER TABLE builds RENAME TO builds_away");
+    await call("human", "build_control", { build_id: buildId, action: "cancel" });
+    // Now the alarm's kill switch read fails too.
+    await relaySql("ALTER TABLE kill_switch RENAME TO kill_switch_away");
+    const alarmAt = () => runInDurableObject(buildStub(buildId), (_instance, state) => state.storage.getAlarm());
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const before = Date.now();
+      expect(await runAlarm(buildId)).toBe(true); // the alarm itself doesn't throw…
+      const next = await alarmAt();
+      expect(next).toBeGreaterThan(before); // …and always re-arms the retry
+      expect(next).toBeLessThanOrEqual(Date.now() + 60_000);
+      expect(((await buildSql(buildId, "SELECT summary_dirty FROM local_state")) as Json[])[0].summary_dirty).toBe(1);
+    }
+    await relaySql("ALTER TABLE kill_switch_away RENAME TO kill_switch");
+    await relaySql("ALTER TABLE builds_away RENAME TO builds");
+    await runAlarm(buildId);
+    const [row] = (await relaySql("SELECT status FROM builds WHERE build_id = ?", buildId)) as Json[];
+    expect(row.status).toBe("cancelled");
+    expect(((await buildSql(buildId, "SELECT summary_dirty FROM local_state")) as Json[])[0].summary_dirty).toBe(0);
+    expect(await alarmAt()).toBeNull();
+  });
 });
 
 describe("storage written by the previous version", () => {
@@ -205,20 +229,42 @@ describe("storage written by the previous version", () => {
       const sql = state.storage.sql;
       sql.exec("DROP TABLE writes");
       sql.exec("DROP TABLE local_state");
+      sql.exec("DROP TABLE notices");
       sql.exec("ALTER TABLE messages DROP COLUMN next_task_id");
+      sql.exec("ALTER TABLE build DROP COLUMN write_count");
       (instance as unknown as { migrate(): void }).migrate();
     });
     await call("human", "build_control", { build_id: buildId, action: "resume" });
-    const { task } = await call("developer", "ledger_update", { build_id: buildId, task_id: taskId, status: "in_progress" });
-    expect(task).toMatchObject({ status: "in_progress", ready: true });
-    expect((await ledger(buildId)).messages[0]).toMatchObject({ id: "M1", next_task_id: null });
+    const { task } = await call("developer", "ledger_update", { build_id: buildId, task_id: taskId, status: "blocked" });
+    expect(task).toMatchObject({ status: "blocked", ready: true });
+    const migrated = await ledger(buildId);
+    expect(migrated.messages[0]).toMatchObject({ id: "M1", next_task_id: null });
+    expect(migrated.build.write_count).toBe(1);
+    expect(migrated.messages.at(-1).body).toBe("T1 is blocked (developer).");
+    expect(await buildSql(buildId, "SELECT global_halted, kill_epoch FROM local_state")).toEqual([{ global_halted: 0, kill_epoch: 0 }]);
 
-    await runInDurableObject(relayStub(), (instance, state) => {
-      state.storage.sql.exec("ALTER TABLE wakes DROP COLUMN role");
+    // A local_state table from the first fix round (no kill_epoch yet) gains the column.
+    await runInDurableObject(buildStub(buildId), (instance, state) => {
+      state.storage.sql.exec("ALTER TABLE local_state DROP COLUMN kill_epoch");
       (instance as unknown as { migrate(): void }).migrate();
     });
-    const columns = (await relaySql("SELECT name FROM pragma_table_info('wakes')")) as Json[];
-    expect(columns.map((column) => column.name)).toContain("role");
+    expect(await buildSql(buildId, "SELECT kill_epoch FROM local_state")).toEqual([{ kill_epoch: 0 }]);
+
+    await runInDurableObject(relayStub(), (instance, state) => {
+      const sql = state.storage.sql;
+      sql.exec("ALTER TABLE wakes DROP COLUMN role");
+      sql.exec("ALTER TABLE kill_switch DROP COLUMN epoch");
+      sql.exec("ALTER TABLE kill_switch DROP COLUMN cleared");
+      sql.exec("ALTER TABLE builds DROP COLUMN kill_epoch");
+      (instance as unknown as { migrate(): void }).migrate();
+    });
+    const columns = async (table: string) => ((await relaySql(`SELECT name FROM pragma_table_info('${table}')`)) as Json[]).map((c) => c.name);
+    expect(await columns("wakes")).toContain("role");
+    expect(await columns("kill_switch")).toEqual(expect.arrayContaining(["epoch", "cleared"]));
+    expect(await columns("builds")).toContain("kill_epoch");
+    // The switch keeps working on the migrated rows.
+    await call("human", "kill_switch", { on: true, reason: "After migration" });
+    expect(await buildSql(buildId, "SELECT global_halted FROM local_state")).toEqual([{ global_halted: 1 }]);
   });
 });
 

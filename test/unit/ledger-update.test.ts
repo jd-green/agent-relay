@@ -140,12 +140,17 @@ describe("ledger_update: permission matrix", () => {
     // Setting the same reviewer again is not a change.
     await call("orchestrator", "ledger_update", { build_id: buildId, task_id: taskId, reviewer: "creative-director", note: "Same reviewer" });
 
-    // Once the loop is paused the orchestrator may clear it, but round 1 still needs its approval.
-    await call("orchestrator", "ledger_update", { build_id: buildId, task_id: taskId, status: "in_progress" });
-    await call("orchestrator", "ledger_update", { build_id: buildId, task_id: taskId, reviewer: null });
+    // Moving the task out of the loop doesn't unlock the reviewer: once reviewed, only the human changes it.
+    await call("orchestrator", "ledger_update", { build_id: buildId, task_id: taskId, status: "todo" });
+    for (const reviewer of [null, "orchestrator"]) {
+      const message = await expectError("orchestrator", "ledger_update", { build_id: buildId, task_id: taskId, reviewer }, "conflict");
+      expect(message).toBe("T1 has been reviewed (round 1): only James may change its reviewer");
+    }
+    await call("human", "ledger_update", { build_id: buildId, task_id: taskId, reviewer: null });
+    // Round 1 still needs its approval.
     await expectError("orchestrator", "ledger_update", { build_id: buildId, task_id: taskId, status: "done" }, "conflict");
     await expectError("developer", "ledger_update", { build_id: buildId, task_id: taskId, status: "done" }, "conflict");
-    expect((await task(buildId, taskId)).status).toBe("in_progress");
+    expect((await task(buildId, taskId)).status).toBe("todo");
   });
 
   it("lets the human override anything", async () => {
@@ -262,5 +267,29 @@ describe("ledger_update: permission matrix", () => {
     const { buildId, taskId } = await inProgressBuild();
     await expectError("orchestrator", "ledger_update", { build_id: buildId, task_id: taskId }, "invalid_input");
     await expectError("orchestrator", "ledger_update", { build_id: buildId, task_id: "T9", note: "x" }, "not_found");
+  });
+});
+
+describe("ledger_update: dependencies and limits", () => {
+  it("refuses depends_on that would form a cycle, also through other tasks", async () => {
+    const { buildId, taskId } = await inProgressBuild();
+    const second = await createTask(buildId, { title: "Ship", depends_on: [taskId] });
+    const third = await createTask(buildId, { title: "Announce", depends_on: [second] });
+    const direct = await expectError("orchestrator", "ledger_update", { build_id: buildId, task_id: taskId, depends_on: [second] }, "invalid_input");
+    expect(direct).toBe("depends_on would create a cycle (T1 -> T2 -> T1); a task can't wait on itself");
+    const around = await expectError("human", "ledger_update", { build_id: buildId, task_id: taskId, depends_on: [third] }, "invalid_input");
+    expect(around).toBe("depends_on would create a cycle (T1 -> T3 -> T2 -> T1); a task can't wait on itself");
+    expect((await task(buildId, taskId)).depends_on).toEqual([]);
+    // Shared dependencies are fine (no cycle).
+    const { task: diamond } = await call("orchestrator", "ledger_update", { build_id: buildId, task_id: third, depends_on: [second, taskId, taskId] });
+    expect(diamond.depends_on).toEqual([second, taskId]);
+  });
+
+  it("holds at most 100 tasks per build", async () => {
+    const build = await createBuild();
+    for (let i = 1; i <= 100; i += 1) await call("human", "ledger_update", { build_id: build.build_id, title: `Task ${i}`, assignee: "developer" });
+    const message = await expectError("human", "ledger_update", { build_id: build.build_id, title: "One more", assignee: "developer" }, "conflict");
+    expect(message).toBe(`build ${build.build_id} already has 100 tasks, the most a build holds; update or reuse existing tasks`);
+    await expectError("orchestrator", "ledger_update", { build_id: build.build_id, title: "One more", assignee: "developer" }, "conflict");
   });
 });

@@ -42,6 +42,8 @@ export RELAY_URL=https://<worker>
 scripts/role-session.sh developer   # token via op read; see SETUP §6
 ```
 
+Role sessions run as one OS user can read each other's tokens: see the threat model in SETUP §6.
+
 Live checks with real Claude sessions (they cost model usage) are described in [`test/live/README.md`](test/live/README.md).
 
 ## Milestones

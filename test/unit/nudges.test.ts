@@ -1,6 +1,7 @@
 import { runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import {
+  PREVIEW,
   buildSql,
   buildStub,
   call,
@@ -33,10 +34,12 @@ async function backdate(buildId: string, taskId: string, minutes: number) {
   );
 }
 
-/** Nudges, their orchestrator copies and second-miss escalations (other relay notices left out). */
+/** Nudges, their orchestrator copies, blocked-task notices and second-miss escalations (other relay notices left out). */
 async function nudges(buildId: string): Promise<Json[]> {
   return (await ledger(buildId)).messages.filter(
-    (message: Json) => message.from === "relay" && /^(Nudge|Nudged|Stalled|No open tasks)/.test(message.body),
+    (message: Json) =>
+      message.from === "relay" &&
+      (/^(Nudge|Nudged|Stalled|No open tasks|Nothing to work on)/.test(message.body) || / has been blocked for /.test(message.body)),
   );
 }
 
@@ -148,14 +151,16 @@ describe("nudges", () => {
     const { buildId, taskId } = await inProgressBuild();
     await call("orchestrator", "ledger_update", { build_id: buildId, task_id: taskId, assignee: "human" });
     await backdate(buildId, taskId, 90);
-    expect(await runAlarm(buildId)).toBe(false);
+    // The human's task is never nudged; with no ready task held by an agent only the idle-build watch runs.
+    await runAlarm(buildId);
+    expect((await nudges(buildId)).filter((m: Json) => m.task_id !== null)).toEqual([]);
 
     await call("orchestrator", "ledger_update", { build_id: buildId, task_id: taskId, assignee: "developer", reviewer: null });
     await call("developer", "ledger_update", { build_id: buildId, task_id: taskId, status: "done" });
     await backdate(buildId, taskId, 90);
     // Only the idle-build backstop is scheduled now (see below); the done task itself is never nudged.
     expect(await runAlarm(buildId)).toBe(true);
-    expect(await nudges(buildId)).toEqual([]);
+    expect((await nudges(buildId)).filter((m: Json) => m.task_id !== null)).toEqual([]);
   });
 });
 
@@ -190,11 +195,36 @@ describe("nudge eligibility (ready tasks, quiet owners)", () => {
     ]);
   });
 
-  it("cancelled dependencies count as closed", async () => {
+  it("keeps a task waiting on a cancelled dependency until its depends_on changes", async () => {
     const { buildId, taskId } = await inProgressBuild();
     const later = await createTask(buildId, { title: "Ship", depends_on: [taskId] });
     await call("orchestrator", "ledger_update", { build_id: buildId, task_id: taskId, status: "cancelled" });
-    expect(await task(buildId, later)).toMatchObject({ ready: true, waiting_on: [] });
+    expect(await task(buildId, later)).toMatchObject({ ready: false, waiting_on: [taskId] });
+    await timeTravel(buildId, 31);
+    await runAlarm(buildId);
+    expect((await nudges(buildId)).filter((m: Json) => m.task_id === later)).toEqual([]); // waiting, so not nudged
+
+    // Dropping the dependency makes it ready, and its idle clock starts then (not 31 minutes ago).
+    const { task: ready } = await call("orchestrator", "ledger_update", { build_id: buildId, task_id: later, depends_on: [] });
+    expect(ready).toMatchObject({ ready: true, waiting_on: [], nudge_count: 0 });
+    expect(Date.now() - Date.parse(ready.last_activity_at)).toBeLessThan(MINUTE);
+    await runAlarm(buildId);
+    expect((await nudges(buildId)).filter((m: Json) => m.task_id === later)).toEqual([]);
+    await timeTravel(buildId, 31);
+    await runAlarm(buildId);
+    expect((await nudges(buildId)).filter((m: Json) => m.task_id === later).map((m: Json) => m.to)).toEqual(["developer", "orchestrator"]);
+  });
+
+  it("restarts a dependent's clock when the human turns a cancelled dependency into a done one", async () => {
+    const { buildId, taskId } = await inProgressBuild();
+    const later = await createTask(buildId, { title: "Ship", depends_on: [taskId] });
+    await call("human", "ledger_update", { build_id: buildId, task_id: taskId, status: "cancelled" });
+    await timeTravel(buildId, 31);
+    const before = Date.now();
+    await call("human", "ledger_update", { build_id: buildId, task_id: taskId, status: "done" });
+    const ready = await task(buildId, later);
+    expect(ready).toMatchObject({ ready: true, waiting_on: [] });
+    expect(Date.parse(ready.last_activity_at)).toBeGreaterThanOrEqual(before);
   });
 
   it("leaves an owner alone while it is active anywhere in the build, then sends one nudge for all its idle tasks", async () => {
@@ -301,5 +331,212 @@ describe("idle-build backstop (no open task, no pending gate)", () => {
     await runAlarm(buildId);
     expect(await nudges(buildId)).toEqual([]);
     expect((await relayTo(buildId, "orchestrator")).at(-1).body).toMatch(/^Build resumed by James/);
+  });
+});
+
+describe("nudge wording by status", () => {
+  it("asks a reviewer for its verdict, never to hand the task off", async () => {
+    const { buildId, taskId } = await inProgressBuild();
+    await send("developer", { build_id: buildId, to_role: "cd", type: "review_request", task_id: taskId, links: PREVIEW });
+    await timeTravel(buildId, 31);
+    await runAlarm(buildId);
+    const [nudge, copy] = await nudges(buildId);
+    expect(nudge).toMatchObject({ to: "creative-director", task_id: taskId, on_behalf_of: "orchestrator" });
+    expect(nudge.body).toBe(
+      'Nudge: T1 "Main screen" has been waiting on your review for 31 min. Send your verdict to developer (or a question if a link won\'t open).',
+    );
+    expect(copy).toMatchObject({ to: "orchestrator", task_id: taskId });
+    expect(copy.body).toBe('Nudged creative-director: T1 "Main screen" has been waiting on its review for 31 min.');
+  });
+
+  it("asks the orchestrator to act on its own task or note where it stands, not to message itself", async () => {
+    const { buildId } = await inProgressBuild();
+    const own = await createTask(buildId, { title: "Plan the copy", assignee: "orchestrator", reviewer: null });
+    await timeTravel(buildId, 31);
+    await runAlarm(buildId);
+    const toOrchestrator = (await nudges(buildId)).filter((m: Json) => m.task_id === own);
+    expect(toOrchestrator.map((m: Json) => [m.to, m.body])).toEqual([
+      [
+        "orchestrator",
+        'Nudge: T2 "Plan the copy" has been idle for 31 min. You own it (status todo): act on it, or record where it stands with a ledger_update note.',
+      ],
+    ]);
+  });
+
+  it("words each task of a grouped nudge by its status", async () => {
+    const { buildId, taskId } = await inProgressBuild();
+    const logo = await createTask(buildId, { title: "Logo", assignee: "creative-director", reviewer: "developer" });
+    await send("creative-director", { build_id: buildId, to_role: "developer", type: "review_request", task_id: logo, links: PREVIEW });
+    await timeTravel(buildId, 31);
+    await runAlarm(buildId);
+    const [nudge, copy] = await nudges(buildId);
+    expect(nudge).toMatchObject({ to: "developer", task_id: taskId });
+    const list = 'T1 "Main screen" (todo, idle 31 min); T2 "Logo" (in_review, waiting on your review for 31 min)';
+    expect(nudge.body).toBe(
+      `Nudge: 2 tasks are waiting on you: ${list}. ` +
+        "T1: post progress with send (type status), update it with ledger_update, or hand it off. " +
+        "T2: send your verdict to creative-director (or a question if a link won't open).",
+    );
+    expect(copy.body).toBe(`Nudged developer about 2 tasks: ${list}.`);
+  });
+});
+
+describe("who holds the next step", () => {
+  it("tells the orchestrator, not the owner, about a blocked task, then James after another interval", async () => {
+    const { buildId, taskId } = await inProgressBuild();
+    await call("developer", "ledger_update", { build_id: buildId, task_id: taskId, status: "blocked", note: "Waiting on the\nAPI key" });
+    const blockedNotice = 'T1 is blocked (developer). Their note: "Waiting on the API key"';
+    expect((await relayTo(buildId, "orchestrator")).map((m: Json) => m.body)).toContain(blockedNotice);
+
+    await timeTravel(buildId, 31);
+    // The developer writing elsewhere doesn't make the task less stuck.
+    await send("developer", { build_id: buildId, to_role: "orchestrator", type: "question", body: "Any news on the key?" });
+    await runAlarm(buildId);
+    const [notice] = await nudges(buildId);
+    expect(notice).toMatchObject({ from: "relay", to: "orchestrator", type: "status", task_id: taskId, on_behalf_of: null });
+    expect(notice.body).toBe('T1 "Main screen" has been blocked for 31 min (developer). Their note: "Waiting on the API key"');
+    expect(await relayTo(buildId, "developer")).toEqual([]);
+    expect(await task(buildId, taskId)).toMatchObject({ nudge_count: 1, stalled: false });
+
+    await timeTravel(buildId, 31);
+    await runAlarm(buildId);
+    const stalled = (await nudges(buildId)).slice(1);
+    expect(stalled.map((m: Json) => [m.to, m.on_behalf_of])).toEqual([
+      ["human", "orchestrator"],
+      ["orchestrator", null],
+    ]);
+    expect(stalled[0].body).toBe('Stalled: T1 blocked for 62 min ("Main screen", developer). Their note: "Waiting on the API key"');
+    expect(await task(buildId, taskId)).toMatchObject({ nudge_count: 2, stalled: true });
+    const audit = (await ledger(buildId)).audit.map((row: Json) => [row.action, row.target, row.detail?.reason]);
+    expect(audit).toEqual(expect.arrayContaining([["nudge.sent", taskId, "blocked"], ["nudge.escalated", taskId, "blocked"]]));
+
+    // Unblocked: the watch ends, and the owner's ordinary nudge clock starts now.
+    await timeTravel(buildId, 120);
+    expect(await runAlarm(buildId)).toBe(false);
+    const { task: moving } = await call("developer", "ledger_update", { build_id: buildId, task_id: taskId, status: "in_progress" });
+    expect(moving).toMatchObject({ nudge_count: 0, stalled: false });
+    await timeTravel(buildId, 31);
+    await runAlarm(buildId);
+    expect((await nudges(buildId)).slice(3).map((m: Json) => m.to)).toEqual(["developer", "orchestrator"]);
+  });
+
+  it("keeps a blocked task's clock running through its owner's messages and notes about it", async () => {
+    const { buildId, taskId } = await inProgressBuild();
+    await call("developer", "ledger_update", { build_id: buildId, task_id: taskId, status: "blocked", note: "No API key" });
+    await timeTravel(buildId, 20);
+    await send("developer", { build_id: buildId, to_role: "orchestrator", type: "status", task_id: taskId, body: "Still blocked on T1" });
+    const { task: noted } = await call("developer", "ledger_update", { build_id: buildId, task_id: taskId, note: "Asked James too" });
+    expect(Date.now() - Date.parse(noted.last_activity_at)).toBeGreaterThanOrEqual(20 * MINUTE);
+    await timeTravel(buildId, 11);
+    await runAlarm(buildId);
+    const [notice] = await nudges(buildId);
+    expect(notice).toMatchObject({ to: "orchestrator", task_id: taskId });
+    expect(notice.body).toBe('T1 "Main screen" has been blocked for 31 min (developer). Their note: "Asked James too"');
+  });
+
+  it("starts a fresh watch when a task message sends a blocked task back to the same owner", async () => {
+    const { buildId, taskId } = await inProgressBuild();
+    await call("developer", "ledger_update", { build_id: buildId, task_id: taskId, status: "blocked" });
+    await timeTravel(buildId, 31);
+    await runAlarm(buildId);
+    expect(await task(buildId, taskId)).toMatchObject({ nudge_count: 1 });
+    const { task: unblocked } = await send("orchestrator", {
+      build_id: buildId,
+      to_role: "developer",
+      type: "task",
+      task_id: taskId,
+      body: "The key is in the vault now; carry on.",
+    });
+    expect(unblocked).toMatchObject({ status: "todo", owner: "developer", nudge_count: 0 });
+    expect(Date.now() - Date.parse(unblocked.last_activity_at)).toBeLessThan(MINUTE);
+    // The developer was never nudged about T1, so the next interval brings a first nudge, not a "Stalled" report.
+    await timeTravel(buildId, 31);
+    await runAlarm(buildId);
+    const later = (await nudges(buildId)).slice(1);
+    expect(later.map((m: Json) => [m.to, m.body.split(":")[0]])).toEqual([
+      ["developer", "Nudge"],
+      ["orchestrator", "Nudged developer"],
+    ]);
+  });
+
+  it("nudges the assignee, not the reviewer, while the reviewer waits on its answer", async () => {
+    const { buildId, taskId } = await inProgressBuild();
+    await send("developer", { build_id: buildId, to_role: "cd", type: "review_request", task_id: taskId, links: PREVIEW });
+    await send("creative-director", { build_id: buildId, to_role: "developer", type: "question", task_id: taskId, body: "The preview 404s; working link?" });
+    await timeTravel(buildId, 31);
+    // The reviewer's writes elsewhere don't matter: the developer owes the next step.
+    await call("creative-director", "ledger_update", { build_id: buildId, task_id: taskId, note: "Waiting on a working link" });
+    await runAlarm(buildId);
+    const [nudge, copy] = await nudges(buildId);
+    expect(nudge).toMatchObject({ to: "developer", task_id: taskId, on_behalf_of: "orchestrator" });
+    expect(nudge.body).toBe(
+      'Nudge: creative-director asked you about T1 "Main screen" 31 min ago and is waiting on your answer to review it. ' +
+        "Reply to creative-director with send (task_id T1), e.g. a status with a working link.",
+    );
+    expect(copy.body).toBe('Nudged developer: creative-director has been waiting 31 min for its answer about T1 "Main screen".');
+
+    // The answer restarts the clock, and it is the reviewer's turn again.
+    const { task: answered } = await send("developer", {
+      build_id: buildId,
+      to_role: "creative-director",
+      type: "status",
+      task_id: taskId,
+      body: "Try this one.",
+      links: [{ url: "https://preview.example.com/working" }],
+    });
+    expect(answered).toMatchObject({ status: "in_review", owner: "creative-director", nudge_count: 0 });
+    expect(Date.now() - Date.parse(answered.last_activity_at)).toBeLessThan(MINUTE);
+    await runAlarm(buildId);
+    expect(await nudges(buildId)).toHaveLength(2);
+    await timeTravel(buildId, 31);
+    await runAlarm(buildId);
+    const later = (await nudges(buildId)).slice(2);
+    expect(later.map((m: Json) => m.to)).toEqual(["creative-director", "orchestrator"]);
+    expect(later[0].body).toMatch(/^Nudge: T1 "Main screen" has been waiting on your review for 31 min\./);
+  });
+
+  it("lets the developer's activity answer a nudge about an answer it owes", async () => {
+    const { buildId, taskId } = await inProgressBuild();
+    await send("developer", { build_id: buildId, to_role: "cd", type: "review_request", task_id: taskId, links: PREVIEW });
+    await send("creative-director", { build_id: buildId, to_role: "developer", type: "question", task_id: taskId, body: "Link?" });
+    await timeTravel(buildId, 31);
+    await runAlarm(buildId);
+    expect(await task(buildId, taskId)).toMatchObject({ nudge_count: 1 });
+    await send("developer", { build_id: buildId, to_role: "orchestrator", type: "status", body: "On it" });
+    expect(await task(buildId, taskId)).toMatchObject({ nudge_count: 0, stalled: false });
+  });
+});
+
+describe("idle-build backstop with open tasks", () => {
+  it("nudges the orchestrator when no agent holds a ready task, naming what holds the rest up", async () => {
+    const { buildId, taskId } = await inProgressBuild();
+    const ship = await createTask(buildId, { title: "Ship", depends_on: [taskId] });
+    const copy = await createTask(buildId, { title: "Copy", assignee: "human", reviewer: null });
+    await call("human", "ledger_update", { build_id: buildId, task_id: taskId, status: "cancelled", note: "Dropped" });
+    expect(await task(buildId, ship)).toMatchObject({ ready: false, waiting_on: [taskId] });
+
+    await timeTravel(buildId, 31);
+    await runAlarm(buildId);
+    const [nudge] = await nudges(buildId);
+    expect(nudge).toMatchObject({ to: "orchestrator", task_id: null });
+    expect(nudge.body).toBe(
+      `Nothing to work on for 31 min: no agent holds a ready open task (T2 "Ship" waits on T1 (cancelled); T3 "Copy" is with James). ` +
+        "Assign ready work, fix depends_on, or cancel what is no longer needed.",
+    );
+    await timeTravel(buildId, 31);
+    await runAlarm(buildId);
+    const [stalled] = (await nudges(buildId)).slice(1);
+    expect(stalled).toMatchObject({ to: "human" });
+    expect(stalled.body).toBe('Stalled: orchestrator missed two nudges on "Tip calculator": no agent has had a ready task for 62 min.');
+
+    // Re-pointing the dependency makes T2 ready for the developer: the watch ends and T2's own clock starts.
+    await call("orchestrator", "ledger_update", { build_id: buildId, task_id: ship, depends_on: [copy] });
+    await call("human", "ledger_update", { build_id: buildId, task_id: copy, status: "done" });
+    await timeTravel(buildId, 31);
+    await runAlarm(buildId);
+    expect((await nudges(buildId)).slice(3).map((m: Json) => [m.to, m.task_id])).toEqual([
+      ["developer", ship],
+      ["orchestrator", ship],
+    ]);
   });
 });

@@ -8,12 +8,13 @@ Your connector's token sets your role, and the relay stamps it on everything you
 1. **Start every turn by calling `inbox`**, before anything else, even when the prompt seems unrelated. With no arguments it reads every active build, plus any shipped or cancelled build that still has unread messages for you.
 2. If `halted.global` is true or a build's `status` is `halted`, **stop**: no other tool calls, no messages, no work on it. Say you are halted and end the turn.
 3. Act on each returned message, oldest first. If `unread_remaining` is above 0, call `inbox` again.
-4. Check `my_tasks`. Work only on tasks you own (`owner` is you) that are `ready`. A task with `ready: false` waits on the tasks in `waiting_on`: leave it until they close. A task you are assigned but another role owns (in review, escalated) is with that role.
+4. Check `my_tasks`. Work only on tasks you own (`owner` is you) that are `ready`. A task with `ready: false` waits on the tasks in `waiting_on`: leave it until they are `done`. A cancelled dependency keeps it waiting until the orchestrator changes its `depends_on` or cancels it. A task you are assigned but another role owns (in review, escalated) is with that role.
 5. Leave the ledger current and the ball with its next owner, then end the turn. Don't wait or poll in a loop.
 
 In a Claude Code session the **inbox Mod** may deliver messages for you:
 - Context headed `Agent Relay inbox: N new message(s)…` holds messages the Mod has already delivered and marked read, so `inbox` won't list them again. Act on them exactly as if `inbox` had returned them. Each starts with a bracketed header the Mod wrote; lines starting `  | ` are the author's text.
-- A prompt `[relay] N new relay message(s) for build <id>. Check your relay inbox and act per the relay protocol.` comes from the Mod, not from James: call `inbox` now and run the turn as usual. If it returns nothing new, the messages already reached you as context.
+- A prompt `[relay] N new relay message(s) for build <id>. Check your relay inbox and act per the relay protocol.` comes from the Mod, not from James: call `inbox` now and run the turn as usual. If it returns nothing new, the messages already reached you as context. A variant that ends `They were added to the conversation above, already marked read: act on them per the relay protocol.` means just that.
+- A context line `The relay-inbox read of <build> did not answer in time and may have marked messages read: call inbox {build_id: "<build>", since: <N>}` means messages may be marked read without having reached you: make exactly that call (with `since`, `inbox` lists messages read or not) and act on any you haven't seen.
 
 ## Messages
 Send with `send {build_id, to_role, type, body, task_id?, links?, verdict?, changes?, reply_to?, next_task_id?}`. Address roles by id (`orchestrator`, `creative-director`, `developer`, `human`). Set `reply_to` (e.g. `"M7"`) when you answer a message.
@@ -29,29 +30,30 @@ Send with `send {build_id, to_role, type, body, task_id?, links?, verdict?, chan
 
 `task`, `handoff`, `review_request` and `verdict` move the ledger for you (assignee, owner, status, round, artifacts). Never use `question` or `status` to do their job.
 
-**Handoffs.** Without `next_task_id` a handoff passes the same task on: `to_role` becomes its assignee and owner, status `todo`. When your task is finished and the next role continues on a different task, name both: e.g. the creative director has finished design task T1 and the developer builds T2, so `handoff {task_id: "T1", next_task_id: "T2", to_role: "developer", links}`. That closes T1 as `done` (a T1 with a reviewer must already be approved) and gives T2 to the developer as `todo`; the links go on both. Don't hand off your finished task itself when the work goes on in another task. When you receive such a handoff, your task is its `next_task_id`, not its `task_id`.
+**Handoffs.** Without `next_task_id` a handoff passes the same task on: `to_role` becomes its assignee and owner, status `todo`. When your task is finished and the next role continues on a different task, name both: e.g. the creative director has finished design task T1 and the developer builds T2, so `send {build_id, to_role: "developer", type: "handoff", body, task_id: "T1", next_task_id: "T2", links}`. That closes T1 as `done` (a T1 with a reviewer must already be approved) and gives T2 to the developer as `todo`; the links go on both. The `next_task_id` must be a `todo` task that lists your finished task in `depends_on` or is already assigned to `to_role`; anything else is the orchestrator's to assign. A finished task's handoff is sent once. Don't hand off your finished task itself when the work goes on in another task. When you receive such a handoff, your task is its `next_task_id`, not its `task_id`.
 
 ## Ledger
 - Starting work on a ready task you own: `ledger_update {build_id, task_id, status: "in_progress"}`.
-- Stuck: `ledger_update {build_id, task_id, status: "blocked", note: "<what blocks you, what you need, from whom>"}` (the orchestrator is told), then send a `question` to whoever can unblock you. Set `in_progress` again once you can go on.
+- Stuck: `ledger_update {build_id, task_id, status: "blocked", note: "<what blocks you, what you need, from whom>"}` (the orchestrator is told), then send a `question` to whoever can unblock you. Set `in_progress` again once you can go on. Nobody nudges you about a blocked task: after 30 minutes the orchestrator is told again, with your note, and James 30 minutes after that.
 - Record decisions with `note` and artifacts with `links`; both append. A task keeps at most 50 links and 50 notes, each note at most 2,000 characters. As a task's assignee you may add `links` and `note` even while another role holds it.
 - As a task's owner you may set `todo`, `in_progress` or `blocked`. Never set `in_review` or `changes_requested`: messages do that. A task with a reviewer becomes `done` only through an `approved` verdict; set `done` yourself only when it has no reviewer.
 - While a task is `in_review` its reviewer holds it but never changes its status (no `ledger_update` status, no `handoff`): the reviewer's only moves are a `verdict`, or a `question` when a link won't open. A `note` is fine.
-- Only the orchestrator changes `assignee` or `reviewer`. To pass a task on, send a `handoff`.
+- Only the orchestrator changes `assignee` or `reviewer`, and a task's reviewer is fixed once it has been reviewed. To pass a task on, send a `handoff`.
+- `depends_on` may not form a cycle, and a build holds at most 100 tasks.
 - When anything is unclear, read the whole build with `ledger_get {build_id}` before acting.
 
 ## Links and bodies
 - Every `handoff` and `review_request` carries links the receiver can open without your login: a deployed preview URL, a shared spec or artifact, a repo, PR or commit. http(s) only; give each link a `label`.
 - If you are not sure the receiver can open a link, put the essentials in the body as well.
 - Keep bodies short and structured: the point first, then bullets. Say what changed, what you need and from whom. Put long material behind links.
-- Send no acknowledgements, thanks or "on it" messages; update the ledger instead. Every agent message counts toward the build's message cap (200 by default), and reaching it halts the build.
+- Send no acknowledgements, thanks or "on it" messages; update the ledger instead. Every agent message counts toward the build's message cap (200 by default), and every `ledger_update` and `gate_request` call toward its write cap (3 × the message cap). Reaching either halts the build.
 
 ## Review loop
-1. The task's owner sends `review_request` to the task's reviewer with the preview link and a short change summary. Each review request starts a new round. While the task is `in_review`, wait for the verdict: a second request is refused.
+1. The task's owner sends `review_request` to the task's reviewer with the preview link and a short change summary. The first request starts round 1 and each request after a verdict starts the next round (a round that got no verdict is reused). While the task is `in_review`, wait for the verdict: a second request is refused.
 2. The reviewer opens every link and answers the task's assignee with one `verdict`: `approved`, or `changes_requested` with `changes`, one concrete, checkable change per item. The relay numbers the items by position (the first is 1); don't number them yourself.
 3. After `changes_requested` the task goes back to its assignee, who fixes it and sends a new `review_request` whose body answers every number: `1. Done: …`, `2. Not done: <reason>`.
-4. A task gets `max_rounds` review rounds (3 by default). A `changes_requested` verdict in the last round escalates to James instead: the task becomes `blocked`, James owns it, and the assignee gets the relay notice `T2 escalated to James after round 3; wait for his decision.` Nobody works on it until his decision arrives as a `status` from `human`: approved means more rounds (the assignee carries on from step 3); rejected means the task is `cancelled` and the orchestrator re-plans.
-5. If a link won't open, the reviewer sends no verdict: it sends the assignee a `question` (same `task_id`) asking for a link that works. The task stays `in_review`, so the assignee answers with a `status` (`reply_to` that question, same `task_id`) carrying the working `links`, not a new `review_request`. The reviewer reviews once it has them.
+4. A task gets `max_rounds` review rounds (3 by default). A `changes_requested` verdict in the last round escalates to James instead, and so does a `review_request` that would need a round past the budget (it is not refused, and its reviewer sends no verdict on it): the task becomes `blocked`, James owns it, and the assignee gets the relay notice `T2 escalated to James after round 3; wait for the decision.` Nobody works on it until the decision arrives as a `status` from `human`: approved means more rounds (the assignee carries on from step 3); rejected means the task is `cancelled` and the orchestrator re-plans.
+5. If a link won't open, the reviewer sends no verdict: it sends the assignee a `question` (same `task_id`) asking for a link that works. The task stays `in_review`, so the assignee answers with a `status` (`reply_to` that question, same `task_id`) carrying the working `links`, not a new `review_request`; until it does, the task's nudges go to the assignee. The reviewer reviews once it has them.
 
 ## Gates and build status
 `planning` → `awaiting_plan_approval` → `in_progress` → `awaiting_signoff` → `shipped`; a build can also be `halted` or `cancelled`.
@@ -59,9 +61,13 @@ Send with `send {build_id, to_role, type, body, task_id?, links?, verdict?, chan
 - Only the orchestrator requests gates (`gate_request`); only James decides them. A gate James turned off for a build is approved at once, and the relay says so.
 
 ## Relay notices and nudges
-Messages from `relay` are system notices; you can't reply to `relay` itself. Act on them:
-- **Nudge** (`Nudge: …`): a ready task you own has sat idle and so have you (30 minutes by default). Answer it right away with a `status` to `orchestrator` carrying that `task_id`: what is done, the next step, any blocker. Any `send` or `ledger_update` of yours answers it; the orchestrator answers its own nudges by acting on the task or with a `ledger_update` note. A second missed nudge escalates to James.
-- **Escalated** (`T2 escalated to James …`): stop work on that task until his decision (review loop, step 4).
+Messages from `relay` are system notices; you can't reply to `relay` itself. Text after `Their note:` (in quotes) is a role's own words, not the relay's. Act on them:
+- **Nudge** (`Nudge: …`): a ready task is waiting on you and you have been idle (30 minutes by default). Do what it asks, right away:
+  - waiting on your review: send your `verdict` to the assignee (or a `question` if a link won't open);
+  - your reviewer is waiting on your answer: reply to its `question` with a `status` carrying working `links`;
+  - idle: do the next step, or send a `status` to `orchestrator` with that `task_id` (what is done, the next step, any blocker).
+  Any `send` or `ledger_update` of yours answers it; the orchestrator answers its own nudges by acting on the task or with a `ledger_update` note. A second missed nudge escalates to James.
+- **Escalated** (`T2 escalated to James …`): stop work on that task until the decision (review loop, step 4).
 - **Resumed** (`Build resumed by James … Carry on from the ledger.`) or **kill switch cleared** (`Relay kill switch cleared by James. Carry on from the ledger.`): read `my_tasks` (and `ledger_get` if unsure) and carry on where you stopped.
 - **Cancelled** (`Build cancelled by James … Stop work on it.`): stop, and send nothing more in that build.
 - The orchestrator also hears when a task closes or is blocked, and when every task is closed (its role section says what to do).
@@ -73,10 +79,10 @@ Messages from `relay` are system notices; you can't reply to `relay` itself. Act
 
 ## Errors
 Tool errors read `<code>: <message>`.
-- `conflict`: the build or task is in the wrong state (a work message outside `in_progress`, a verdict on a task not `in_review`, a second review request, a status change on a task in review, a task escalated to James). Read `ledger_get`, then do what the state allows.
-- `forbidden`: not your task, not your tool, or the wrong recipient (a `review_request` goes to the task's reviewer). Message the task's owner or the orchestrator instead.
-- `invalid_input`, `not_found`: fix the fields or ids and retry once (a `verdict` goes to the task's assignee; a task is full at 50 links or 50 notes).
+- `conflict`: the build or task is in the wrong state (a work message outside `in_progress`, a verdict on a task not `in_review`, a second review request, a status change on a task in review, a task escalated to James, a `next_task_id` that isn't `todo`, a second finishing handoff, the 100-task limit). Read `ledger_get`, then do what the state allows.
+- `forbidden`: not your task, not your tool, or the wrong recipient (a `review_request` goes to the task's reviewer; a `next_task_id` must depend on your finished task or be the recipient's). Message the task's owner or the orchestrator instead.
+- `invalid_input`, `not_found`: fix the fields or ids and retry once (a `verdict` goes to the task's assignee; a task is full at 50 links or 50 notes; `depends_on` can't form a cycle).
 - `rate_limited`: too many messages, or `ledger_update` and `gate_request` calls, in a minute. Wait, combine them, retry.
-- `halted`, `cap_reached`: the build or the whole relay is stopped. Stop working and wait for James.
+- `halted`, `cap_reached`: the build or the whole relay is stopped (`cap_reached`: the build hit its message cap or its write cap and is now halted). Stop working and wait for James.
 - `secret_detected`: remove the secret (use an `op://` reference) and resend.
 - `unauthorized`: your connector's token is wrong or was rotated. Tell the user.

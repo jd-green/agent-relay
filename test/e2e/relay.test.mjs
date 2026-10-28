@@ -574,9 +574,16 @@ describe("2. PRD core workflow: kickoff brief to shipped v1", { concurrency: 1 }
     await assertNoUnread([cd, human], buildId);
     const { entry } = await deliver(dev, buildId, [{ id: message.id, from: "creative-director", type: "verdict", verdict: "approved" }]);
     assert.deepEqual(entry.my_tasks.map((t) => [t.id, t.ready, t.waiting_on]), [["T2", true, []]], "T2 is ready now that T1 is done");
-    // DESIGN §6, orchestrator notices: the verdict went to the developer, so the relay tells the orchestrator.
+    // DESIGN §6, orchestrator notices: the verdict went to the developer, so the relay tells the orchestrator,
+    // naming the task the close made ready with its owner and status.
     await deliver(o, buildId, [
-      { from: "relay", type: "status", task_id: "T1", on_behalf_of: null, body: 'T1 "Calculator screen" is done (approved by creative-director in round 2).' },
+      {
+        from: "relay",
+        type: "status",
+        task_id: "T1",
+        on_behalf_of: null,
+        body: 'T1 "Calculator screen" is done (approved by creative-director in round 2). Now ready: T2 "Ship v1" (developer, todo).',
+      },
     ]);
     // A done task is closed (DESIGN §6: review_request is rejected on done tasks); it also has no owner any more.
     await dev.failsAny("send", { build_id: buildId, to_role: "creative-director", type: "review_request", task_id: "T1", body: "Again", links: [PREVIEW_2] }, ["conflict", "forbidden"]);
@@ -799,7 +806,7 @@ describe("3. review cap escalation", { concurrency: 1 }, () => {
     // The assignee is told too, so it waits instead of starting round 4.
     await deliver(dev, buildId, [
       { from: "creative-director", type: "verdict", verdict: "changes_requested" },
-      { from: "relay", type: "status", task_id: "T1", body: "T1 escalated to James after round 3; wait for his decision." },
+      { from: "relay", type: "status", task_id: "T1", body: "T1 escalated to James after round 3; wait for the decision." },
     ]);
     await assertNoUnread([cd], buildId);
 
@@ -870,7 +877,7 @@ describe("3. review cap escalation", { concurrency: 1 }, () => {
     assert.ok(toOrch.messages[1].body.includes("Cut the scope"));
     await deliver(dev, buildId, [
       { from: "creative-director", type: "verdict" },
-      { from: "relay", body: "T1 escalated to James after round 1; wait for his decision." },
+      { from: "relay", body: "T1 escalated to James after round 1; wait for the decision." },
       { from: "human", task_id: "T1" },
     ]);
     await assertNoUnread([cd, human], buildId);
@@ -1001,7 +1008,12 @@ describe("4. nudges with real alarms (NUDGE_AFTER_MINUTES=0.05, i.e. 3 s)", { co
     const handedAt = Date.parse(rr.task.last_activity_at);
     assertFields(rr.task, { owner: "creative-director", nudge_count: 0 });
     const toCd = await waitRelayNote(cd, handedAt, /^Nudge: T1/);
-    assertFields(toCd, { on_behalf_of: "orchestrator", to: "creative-director" });
+    // DESIGN §8: a reviewer is asked for its verdict (a handoff is refused for a task in review).
+    assertFields(toCd, {
+      on_behalf_of: "orchestrator",
+      to: "creative-director",
+      body: /^Nudge: T1 "Calculator screen" has been waiting on your review for \d+ s\. Send your verdict to developer \(or a question if a link won't open\)\.$/,
+    });
     assert.ok(Date.parse(toCd.created_at) - handedAt >= AFTER - SLACK);
     await waitRelayNote(o, handedAt, /creative-director/);
     const devLate = (await relayNotes(dev)).filter((m) => Date.parse(m.created_at) > handedAt);
@@ -1126,6 +1138,75 @@ describe("4. nudges with real alarms (NUDGE_AFTER_MINUTES=0.05, i.e. 3 s)", { co
     assert.equal((await relayAbout(dev)).filter((m) => /^Nudge/.test(m.body)).length, 1, "one nudge, not one per task");
     const copies = (await relayAbout(o)).filter((m) => /^Nudged developer/.test(m.body));
     assert.deepEqual(copies.map((m) => m.body.slice(0, 37)), ["Nudged developer about 2 idle tasks: "]);
+  });
+
+  // DESIGN §8: a blocked owner waits on someone else, so the orchestrator (who can unblock it) hears of it, then James.
+  test("a blocked task: the orchestrator is told after an interval, James after another; the owner is never nudged", async () => {
+    await human.call("build_control", { build_id: buildId, action: "cancel" });
+    buildId = await startBuild(team, { tasks: [{ title: "Share button", assignee: "developer" }] });
+    const { task } = await dev.call("ledger_update", { build_id: buildId, task_id: "T1", status: "blocked", note: "Need the\nshare copy" });
+    const blockedAt = Date.parse(task.last_activity_at);
+    const atOnce = (await relayAbout(o, "T1")).find((m) => m.body.startsWith("T1 is blocked"));
+    assertFields(atOnce, { body: 'T1 is blocked (developer). Their note: "Need the share copy"' }, "the immediate notice");
+    // The developer stays busy elsewhere: that doesn't make the task less stuck.
+    await dev.call("send", { build_id: buildId, to_role: "orchestrator", type: "question", body: "What should the share text say?" });
+
+    const notice = await waitRelay(o, /^T1 "Share button" has been blocked for /, "the blocked-task notice to the orchestrator");
+    assertFields(notice, {
+      to: "orchestrator",
+      task_id: "T1",
+      on_behalf_of: null,
+      body: /^T1 "Share button" has been blocked for \d+ s \(developer\)\. Their note: "Need the share copy"$/,
+    });
+    assert.ok(Date.parse(notice.created_at) - blockedAt >= AFTER - SLACK, "the notice waits NUDGE_AFTER_MINUTES");
+    const stalled = await waitRelay(human, /^Stalled: T1 blocked for /, "the stall report to James");
+    assertFields(stalled, {
+      to: "human",
+      task_id: "T1",
+      on_behalf_of: "orchestrator",
+      body: /^Stalled: T1 blocked for \d+ s \("Share button", developer\)\. Their note: "Need the share copy"$/,
+    });
+    assert.ok(Date.parse(stalled.created_at) - Date.parse(notice.created_at) >= AFTER - SLACK, "James hears an interval later");
+    await waitRelay(o, /^Stalled: T1 blocked for /, "the orchestrator's copy");
+    assertFields(taskIn(await human.call("ledger_get", { build_id: buildId }), "T1"), { status: "blocked", stalled: true, nudge_count: 2 });
+    assert.deepEqual((await relayAbout(dev)).map((m) => m.body), [], "the blocked owner is never nudged");
+  });
+
+  // DESIGN §8: when the reviewer's latest message is an unanswered question to the assignee, the assignee owes the next step.
+  test("a reviewer waiting on a working link: the assignee is nudged, and once it answers, the reviewer", async () => {
+    await human.call("build_control", { build_id: buildId, action: "cancel" });
+    buildId = await startBuild(team);
+    await dev.call("send", { build_id: buildId, to_role: "creative-director", type: "review_request", task_id: "T1", body: "Round 1", links: [PREVIEW_1] });
+    const { message: question } = await cd.call("send", {
+      build_id: buildId,
+      to_role: "developer",
+      type: "question",
+      task_id: "T1",
+      body: "The preview 404s on mobile; can you send a working link?",
+    });
+    const askedAt = Date.parse(question.created_at);
+    const nudge = await waitRelayNote(dev, askedAt, /^Nudge: /);
+    assertFields(nudge, {
+      to: "developer",
+      on_behalf_of: "orchestrator",
+      body: /^Nudge: creative-director asked you about T1 "Calculator screen" \d+ s ago and is waiting on your answer to review it\. Reply to creative-director with send \(task_id T1\), e\.g\. a status with a working link\.$/,
+    });
+    assert.ok(Date.parse(nudge.created_at) - askedAt >= AFTER - SLACK, "the nudge waits NUDGE_AFTER_MINUTES");
+    await waitRelayNote(o, askedAt, /^Nudged developer: creative-director has been waiting \d+ s for its answer about T1 "Calculator screen"\.$/);
+    assert.deepEqual((await relayNotes(cd)).map((m) => m.body), [], "the reviewer, who waits, is not nudged");
+
+    const { message: answer } = await dev.call("send", {
+      build_id: buildId,
+      to_role: "creative-director",
+      type: "status",
+      task_id: "T1",
+      body: "Use this one.",
+      links: [PREVIEW_2],
+    });
+    const answeredAt = Date.parse(answer.created_at);
+    const toCd = await waitRelayNote(cd, answeredAt, /^Nudge: T1/);
+    assertFields(toCd, { body: /^Nudge: T1 "Calculator screen" has been waiting on your review for \d+ s\. Send your verdict to developer/ });
+    assert.ok(Date.parse(toCd.created_at) - answeredAt >= AFTER - SLACK, "the reviewer's clock starts at the answer");
   });
 });
 

@@ -2,7 +2,7 @@ import { atom, read, update } from 'claude-code'
 import type { JsonValue, On, Register, Timer } from 'claude-code'
 
 import type { SpikeWake } from '../types'
-import { type RelayConfig, errorText, readConfig, sha256Prefix, withTimeout } from './relay'
+import { type RelayConfig, type RelayReply, errorText, readConfig, sha256Prefix, withTimeout } from './relay'
 import { Reporter, type SpikeHost } from './reporter'
 
 /** How often the mod's main timer runs: flushes events, writes heartbeats, submits deferred wakes. */
@@ -11,6 +11,11 @@ const HEARTBEAT_MS = 5 * 60_000
 /** A submitted wake whose turn has not started by then is reported once and no longer blocks the next. */
 const WAKE_START_TIMEOUT_MS = 2 * 60_000
 const HEALTH_TIMEOUT_MS = 4_000
+/**
+ * How long a wake poll waits for its answer. The relay consumes the wakes it returns, so the wait is
+ * long (no prompt waits on it); an answer later still is kept as deferred wakes (`wake.late`).
+ */
+const WAKE_POLL_TIMEOUT_MS = 10_000
 /** The most of the exit's short bound spent posting the last records. */
 const EXIT_FLUSH_MS = 1_500
 
@@ -105,7 +110,12 @@ function registerSpike(on: On, config: RelayConfig): void {
   async function pollWakes(engine: EngineHost): Promise<void> {
     try {
       const sessionId = await engine.sessionId()
-      const reply = await reporter.call(engine, `/spike/wake?session_id=${encodeURIComponent(sessionId)}`)
+      const askedAt = await engine.now()
+      const reply = await reporter.call(engine, `/spike/wake?session_id=${encodeURIComponent(sessionId)}`, undefined, {
+        timeoutMs: WAKE_POLL_TIMEOUT_MS,
+        // Consumed on the relay all the same: kept, and submitted once the session is idle.
+        onLate: late => void keepLate(engine, late, askedAt).catch(error => reporter.noteError('late wake', errorText(error))),
+      })
       wakePolls += 1
       if (!reply.ok) return
       for (const wake of readWakes(reply.result)) {
@@ -115,6 +125,16 @@ function registerSpike(on: On, config: RelayConfig): void {
       }
     } catch (error) {
       reporter.noteError('wake poll', errorText(error))
+    }
+  }
+
+  /** Keeps the wakes of a poll that answered after WAKE_POLL_TIMEOUT_MS, each recorded `wake.late`. */
+  async function keepLate(engine: EngineHost, late: RelayReply, askedAt: number): Promise<void> {
+    if (!late.ok) return
+    const answer_s = Math.round(((await engine.now()) - askedAt) / 1000)
+    for (const wake of readWakes(late.result)) {
+      reporter.record('wake.late', { wake_id: wake.id, answer_s }, undefined, { uncapped: true })
+      await defer(engine, wake)
     }
   }
 

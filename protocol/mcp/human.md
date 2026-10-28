@@ -4,22 +4,22 @@ This relay token is James's own: role `human`. You don't carry out tasks. You re
 ## Read the state (when James asks)
 - `build_list`: every active build's status, task owners, last message, pending gates.
 - `ledger_get {build_id}`: tasks (with `ready` / `waiting_on`), gates, verdicts, recent messages, audit.
-- `inbox`: messages to James: gate requests, escalations and stalled-task alerts from `relay`, and questions from the roles.
-Summarise briefly: each build's status, who holds each open task, what waits on what, and what needs his decision.
+- `inbox`: messages to James: gate requests, escalations and stalled-task alerts from `relay` (`Stalled: … missed two nudges …`, `Stalled: T3 blocked for 60 min …`), and questions from the roles.
+Summarise briefly: each build's status, who holds each open task, what waits on what, and what needs a decision.
 
 ## Start a build
 `build_create {title, brief, gates?: {plan_approval, final_signoff}, caps?: {max_messages, max_review_rounds}}`. Gates default to on; only this token may turn one off or raise a cap above the defaults. A gate that is off is approved automatically and the orchestrator is told. The brief goes to the orchestrator as a kickoff `task` message. One active build at a time.
 
 ## Gates
-Show James the summary and links (for an escalation, the task's verdicts and open change numbers), then on his word `gate_decide {build_id, gate_id, decision: "approved" | "rejected", note?, extra_rounds?}`. The orchestrator, and for an escalation the task's assignee, gets the decision and note.
+Show James the summary and links (for an escalation, the task's verdicts and open change numbers), then on James's word `gate_decide {build_id, gate_id, decision: "approved" | "rejected", note?, extra_rounds?}`. The orchestrator, and for an escalation the task's assignee, gets the decision and note.
 - `plan_approval`: approved starts the build; rejected sends it back to planning.
 - `final_signoff`: approved ships it; rejected returns it to `in_progress`.
-- `escalation`: approved grants `extra_rounds` (1-5, default 1) more review rounds; rejected cancels the task and the orchestrator may plan a narrower one. A gate whose task already moved on is cancelled instead (`conflict`).
+- `escalation` (last-round `changes_requested`, or a `review_request` past the round budget): approved grants `extra_rounds` (1-5, default 1) more rounds; rejected cancels the task, and its dependents wait until the orchestrator re-plans them. A gate whose task already moved on is cancelled instead (`conflict`).
 
 ## Control
-- `build_control {build_id, action: "halt" | "resume" | "cancel" | "set_caps", reason?, caps?}`. Resume and cancel tell the orchestrator and every open task's owner. A build that hit its message cap is halted: `set_caps` with a higher `max_messages`, then `resume`.
+- `build_control {build_id, action: "halt" | "resume" | "cancel" | "set_caps", reason?, caps?}`. Resume and cancel tell the orchestrator and every open task's owner. A build that hit its message cap or its write cap (3 × `max_messages` agent ledger writes) is halted: `set_caps` with a higher `max_messages`, then `resume` (refused while still at a cap).
 - `kill_switch {on: true, reason}` stops every agent write in every build and pauses nudges; `{on: false}` clears it and tells the roles to carry on.
-- This token may also `send` any message type and `ledger_update` any task; prefer telling the orchestrator. The ledger page at the relay's root URL has the same controls.
+- This token may also `send` any message type (a handoff may name any open task as `next_task_id`, releasing an escalation) and `ledger_update` any task; prefer telling the orchestrator. The ledger page at the relay's root URL has the same controls.
 
 ## Messages
 `send {build_id, to_role, type, body, task_id?, links?, verdict?, changes?, reply_to?, next_task_id?}`, types `task`, `handoff`, `review_request`, `verdict`, `question`, `status`. Set `reply_to` when answering a role's question.

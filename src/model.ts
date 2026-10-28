@@ -57,6 +57,8 @@ export interface Build {
   gates: { plan_approval: boolean; final_signoff: boolean };
   caps: { max_messages: number; max_review_rounds: number };
   message_count: number;
+  /** Agent ledger_update and gate_request calls so far; the write cap is 3 × caps.max_messages (DESIGN §7). */
+  write_count: number;
   created_by: Role;
   created_at: string;
   updated_at: string;
@@ -95,9 +97,9 @@ export interface Task {
   artifacts: Link[];
   notes: Note[];
   depends_on: string[];
-  /** Every depends_on task is done or cancelled. */
+  /** Every depends_on task is done (a cancelled dependency keeps the task waiting). */
   ready: boolean;
-  /** The depends_on tasks still open. */
+  /** The depends_on tasks not done yet, cancelled ones included. */
   waiting_on: string[];
   last_activity_at: string;
   nudge_count: number;
@@ -180,6 +182,21 @@ export interface Halted {
   global: boolean;
   reason: string | null;
   at: string | null;
+}
+
+/**
+ * The kill switch as RelayDO holds it, with the toggle counter that orders it (DESIGN §7). The Worker passes the
+ * state it read into every build write and RelayDO pushes each toggle; a build adopts a state only when its
+ * epoch is newer than the build's own copy.
+ */
+export interface KillState {
+  halted: Halted;
+  /** Incremented on every toggle. */
+  epoch: number;
+  /** Who made the latest toggle. */
+  by: Role | null;
+  /** The latest toggle turned the switch off while it was on. */
+  cleared: boolean;
 }
 
 export interface InboxBuild {

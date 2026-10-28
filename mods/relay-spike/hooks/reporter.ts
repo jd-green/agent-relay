@@ -1,6 +1,6 @@
 import type { JsonValue, PromptSubmitResult } from 'claude-code'
 
-import { type Host, type RelayConfig, type RelayReply, errorText, relayRequest } from './relay'
+import { type Host, type RelayConfig, type RelayReply, type RequestOptions, errorText, relayRequest } from './relay'
 
 /** What the spike needs from the engine beyond the relay client's calls. */
 export type SpikeHost = Host & {
@@ -91,9 +91,9 @@ export class Reporter {
     }
   }
 
-  /** Calls the relay and keeps the token state and last error up to date. */
-  async call(host: Host, path: string, init?: { method?: 'GET' | 'POST'; body?: unknown }): Promise<RelayReply> {
-    const reply = await relayRequest(host, this.config, path, init)
+  /** Calls the relay and keeps the token state and last error up to date; `options` as relayRequest's. */
+  async call(host: Host, path: string, init?: { method?: 'GET' | 'POST'; body?: unknown }, options?: RequestOptions): Promise<RelayReply> {
+    const reply = await relayRequest(host, this.config, path, init, options)
     // A record the relay refused for itself says nothing about whether the relay answers.
     this.hasLastCallFailed = !reply.ok && !isPermanent(reply.status)
     if (reply.ok) this.tokenState = 'accepted'

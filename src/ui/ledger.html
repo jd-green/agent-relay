@@ -1148,12 +1148,17 @@ legend { padding: 0; margin-bottom: 2px; font-size: 13.5px; font-weight: 600; co
         h('div', { class: 'detail-aside' }, infoSection(build, buildId), presenceSection(arr(result?.threads)), historySection(decided, taskById), auditSection(arr(result?.audit))))));
   }
   const capsOf = (build) => (build.caps && typeof build.caps === 'object' ? build.caps : null);
-  /** Halted by the message cap, or halted while at it: resuming alone would trip the cap again. */
+  /** Agent ledger writes (ledger_update, gate_request) are capped at 3 × the message cap. */
+  const writeCapOf = (build) => 3 * (capsOf(build)?.max_messages ?? 0);
+  /** Halted by the message or ledger write cap, or halted while at one: resuming alone would trip it again. */
   function isCapHalt(build) {
     const caps = capsOf(build);
-    return build.halt_reason === 'message cap reached'
-      || (caps != null && Number.isFinite(caps.max_messages) && (build.message_count ?? 0) >= caps.max_messages);
+    if (build.halt_reason === 'message cap reached' || build.halt_reason === 'ledger write cap reached') return true;
+    return caps != null && Number.isFinite(caps.max_messages)
+      && ((build.message_count ?? 0) >= caps.max_messages || (build.write_count ?? 0) >= writeCapOf(build));
   }
+  /** The smallest message cap that clears both caps: above the messages sent and above a third of the writes. */
+  const minCapFor = (build) => Math.max((build.message_count ?? 0) + 1, Math.floor((build.write_count ?? 0) / 3) + 1);
   function haltCallout(build, buildId) {
     const before = build.status_before_halt;
     return h('div', { class: 'callout', role: 'note' }, icon('pause'),
@@ -1167,28 +1172,31 @@ legend { padding: 0; margin-bottom: 2px; font-size: 13.5px; font-weight: 600; co
     const draftKey = `raise:${buildId}`;
     const busy = state.busy.has(key);
     const used = build.message_count ?? 0;
+    const writes = build.write_count ?? 0;
     const cap = capsOf(build).max_messages;
+    const least = minCapFor(build);
     const [, most] = CAP_LIMITS.max_messages;
     const inputId = `raise-${slug(buildId)}`;
     const input = h('input', {
-      id: inputId, class: 'input', type: 'number', inputmode: 'numeric', min: Math.min(most, used + 1), max: most, step: 1,
-      'data-draft': draftKey, 'data-key': draftKey, value: drafts.get(draftKey) ?? String(Math.min(most, Math.max(cap, used) + 100)), disabled: busy,
+      id: inputId, class: 'input', type: 'number', inputmode: 'numeric', min: Math.min(most, least), max: most, step: 1,
+      'data-draft': draftKey, 'data-key': draftKey, value: drafts.get(draftKey) ?? String(Math.min(most, Math.max(cap, least - 1) + 100)), disabled: busy,
     });
     const btn = h('button', { type: 'button', class: 'btn btn-primary', 'data-key': `control:raise`, disabled: busy }, icon('play'), 'Raise cap and resume');
-    btn.addEventListener('click', () => raiseCapAndResume(buildId, used, inputId));
+    btn.addEventListener('click', () => raiseCapAndResume(buildId, least, inputId));
     const error = h('p', { class: 'form-error', role: 'alert' });
     setError(error, state.errors.get(key));
+    const writeNote = writes >= writeCapOf(build) ? `; ${writes} of ${writeCapOf(build)} ledger writes used` : '';
     return h('div', { class: 'cap-form' },
-      h('label', { for: inputId, text: `New message cap (${used} of ${cap} agent messages used)` }),
+      h('label', { for: inputId, text: `New message cap (${used} of ${cap} agent messages used${writeNote})` }),
       h('div', { class: 'cap-row' }, input, btn), error);
   }
-  async function raiseCapAndResume(buildId, used, inputId) {
+  async function raiseCapAndResume(buildId, least, inputId) {
     const key = `${buildId}:raise`;
     if (state.busy.has(key)) return;
     const n = Number($(inputId)?.value);
     const [, most] = CAP_LIMITS.max_messages;
-    if (!Number.isInteger(n) || n <= used || n > most) {
-      state.errors.set(key, { code: 'invalid_input', message: used >= most ? `The cap is already at its limit of ${most}.` : `Enter a whole number from ${used + 1} to ${most}.` });
+    if (!Number.isInteger(n) || n < least || n > most) {
+      state.errors.set(key, { code: 'invalid_input', message: least > most ? `The cap is already at its limit of ${most}.` : `Enter a whole number from ${least} to ${most}.` });
       render(true);
       $(inputId)?.focus();
       return;
@@ -1362,7 +1370,7 @@ legend { padding: 0; margin-bottom: 2px; font-size: 13.5px; font-weight: 600; co
     const open = !CLOSED_TASK.has(t.status);
     const waiting = open ? waitingOn(t, taskById) : [];
     const badges = [];
-    if (waiting.length) badges.push(h('span', { class: 'badge tone-gray', title: 'Starts when these tasks are done or cancelled', text: `Waiting on ${waiting.join(', ')}` }));
+    if (waiting.length) badges.push(h('span', { class: 'badge tone-gray', title: 'Starts when these tasks are done (a cancelled one keeps it waiting until the Orchestrator re-plans)', text: `Waiting on ${waiting.join(', ')}` }));
     if (t.escalated) badges.push(h('span', { class: 'badge tone-amber', text: 'Escalated' }));
     if (t.stalled) badges.push(h('span', { class: 'badge tone-red', text: 'Stalled' }));
     if (open && !waiting.length && t.owner && t.owner === state.me?.role) badges.push(h('span', { class: 'badge tone-blue', text: 'Waiting on you' }));

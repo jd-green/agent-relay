@@ -1,8 +1,9 @@
 import type { HttpInit, HttpResponse, PluginOptions } from 'claude-code'
 
 /**
- * How long one relay request may take before it counts as unreachable. `$.http.fetch` cannot be
- * aborted, so a request given up on still holds the process until the engine's own timeout ends it.
+ * How long one relay request may take, unless its caller says otherwise, before it counts as
+ * unreachable. `$.http.fetch` cannot be aborted, so a request given up on still holds the process
+ * until the engine's own timeout ends it.
  */
 export const REQUEST_TIMEOUT_MS = 3_000
 
@@ -28,6 +29,7 @@ export type RelayReply =
 
 /** How long a request may take, and who hears its answer when it comes after that. */
 export type RequestOptions = {
+  /** REQUEST_TIMEOUT_MS when absent: shorter on a prompt's path, longer for a poll nobody waits on. */
   timeoutMs?: number
   /** Called with the answer of a request that came back after its timeout (a read that marked mail read). */
   onLate?: (reply: RelayReply) => void
@@ -74,7 +76,7 @@ export async function relayRequest(
   init: { method?: 'GET' | 'POST'; body?: unknown } = {},
   options: RequestOptions = {},
 ): Promise<RelayReply> {
-  const timeoutMs = Math.min(options.timeoutMs ?? REQUEST_TIMEOUT_MS, REQUEST_TIMEOUT_MS)
+  const timeoutMs = options.timeoutMs ?? REQUEST_TIMEOUT_MS
   const headers: Record<string, string> = { authorization: `Bearer ${config.token}` }
   if (init.body !== undefined) headers['content-type'] = 'application/json'
   const answer = (async (): Promise<RelayReply> => {

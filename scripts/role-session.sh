@@ -5,8 +5,8 @@
 #   scripts/role-session.sh <role> [--dir <role-dir>] [--model <model>] [options] [-- <claude args>]
 #
 #   role         orchestrator, creative-director or developer
-#   --dir        the role's working directory (default: ~/relay-roles/<role>; created if missing).
-#                Its CLAUDE.md holds the role Project's own instructions.
+#   --dir        the session's working directory (default: ~/relay-roles/<role>; created if missing).
+#                Its CLAUDE.md holds the role Project's own instructions. Nothing is written into it.
 #   --model      passed on to claude
 #   --no-prompt  start idle, without the first prompt (by default the session starts by checking
 #                its relay inbox, which also loads a hooks module the engine deferred to a turn start)
@@ -16,12 +16,18 @@
 #
 # RELAY_URL is the relay's base URL (https://<worker>, without /mcp). The token comes from
 # <ROLE>_TOKEN (e.g. DEVELOPER_TOKEN), else RELAY_TOKEN, else `op read` of OP_REF_<ROLE>
-# (default "op://Agent Relay/<Role> token/password", as in scripts/put-secrets.sh).
-# The token is never printed, passed as an argument or left in the session's environment; it goes
-# only into these files in the role directory (mode 600, rewritten at every start; keep them out of git):
+# (default "op://Agent Relay/<Role> token/password", as in scripts/put-secrets.sh); for `op`, prefer
+# OP_SERVICE_ACCOUNT_TOKEN of a service account that can read only the role tokens (docs/SETUP.md, section 6).
+# The token is never printed or passed as an argument. It goes only into these files, kept outside
+# the working tree in ${XDG_STATE_HOME:-~/.local/state}/agent-relay/<role>/ (directory mode 700,
+# files mode 600, rewritten at every start) and given to claude by absolute path:
 #   .relay-inbox.json        relay-inbox options                     (claude --settings)
 #   .relay-mcp.json          the relay MCP server with a Bearer header (claude --mcp-config)
 #   .relay-instructions.md   protocol/PROTOCOL.md + the role addendum (claude --append-system-prompt-file)
+# Before claude starts, the relay tokens and the credentials that could reach the others are removed
+# from its environment: every OP_* variable (1Password sessions, service-account and Connect tokens),
+# CLOUDFLARE_API_TOKEN, CLOUDFLARE_API_KEY, CF_API_TOKEN and CF_API_KEY. That stops inheritance only:
+# sessions run as one OS user can still read each other's files (docs/SETUP.md, section 6).
 # Don't also install relay-inbox from the marketplace: two copies would load.
 set -euo pipefail
 
@@ -137,7 +143,8 @@ else
   ref_var="OP_REF_$(upper "$role")"
   ref="${!ref_var:-op://Agent Relay/$(item_title "$role")/password}"
   command -v op >/dev/null || die "no $token_var or RELAY_TOKEN set, and the 1Password CLI (op) is not installed"
-  token="$(op read --no-newline "$ref")" || die "op read \"$ref\" failed: sign in with  eval \"\$(op signin)\"  (or unlock the 1Password app), or set $ref_var"
+  token="$(op read --no-newline "$ref")" ||
+    die "op read \"$ref\" failed: sign in with  eval \"\$(op signin)\"  (or unlock the 1Password app, or set OP_SERVICE_ACCOUNT_TOKEN for this command), or set $ref_var"
   token_source="$ref"
 fi
 # The same rule as scripts/put-secrets.sh: shorter tokens disable the role, and the token goes into JSON as is.
@@ -151,37 +158,58 @@ if $check; then check_role; fi
 dir="${dir:-$HOME/relay-roles/$role}"
 mkdir -p "$dir"
 dir="$(cd "$dir" && pwd -P)"
+
+# The token files live outside the working tree (which may be an app repository the agent commits
+# with git add -A): ${XDG_STATE_HOME:-~/.local/state}/agent-relay/<role>, private to this user.
+state_home="${XDG_STATE_HOME:-}"
+[[ "$state_home" == /* ]] || state_home="$HOME/.local/state" # XDG: ignore a relative path
+session_umask="$(umask)"
 umask 077
+mkdir -p "$state_home/agent-relay/$role"
+state="$(cd "$state_home/agent-relay/$role" && pwd -P)"
+[[ -O "$state" && -O "$(dirname "$state")" ]] || die "$state is not owned by $(id -un); remove it or set XDG_STATE_HOME"
+chmod 700 "$(dirname "$state")" "$state"
+if command -v git >/dev/null && git -C "$state" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  for file in .relay-inbox.json .relay-mcp.json .relay-instructions.md; do
+    git -C "$state" check-ignore -q "$file" ||
+      die "$state is inside a git working tree that doesn't ignore $file: set XDG_STATE_HOME to a directory outside it"
+  done
+fi
+
 printf '{"pluginConfigs":{"relay-inbox":{"options":{"relay_url":"%s","role_token":"%s","auto_wake":true}}}}\n' \
-  "$relay_url" "$token" | write_private "$dir/.relay-inbox.json"
+  "$relay_url" "$token" | write_private "$state/.relay-inbox.json"
 printf '{"mcpServers":{"relay":{"type":"http","url":"%s/mcp","headers":{"Authorization":"Bearer %s"}}}}\n' \
-  "$relay_url" "$token" | write_private "$dir/.relay-mcp.json"
+  "$relay_url" "$token" | write_private "$state/.relay-mcp.json"
 {
   cat "$repo/protocol/PROTOCOL.md"
   printf '\n'
   cat "$repo/protocol/roles/$role.md"
-} | write_private "$dir/.relay-instructions.md"
+} | write_private "$state/.relay-instructions.md"
 
-if command -v git >/dev/null && git -C "$dir" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+# Earlier versions of this script wrote the same files into the working directory: remove them.
+if [[ "$dir" != "$state" ]]; then
   for file in .relay-inbox.json .relay-mcp.json .relay-instructions.md; do
-    git -C "$dir" check-ignore -q "$file" || warn "$dir/$file is not gitignored: add .relay-* to that repository's .gitignore"
+    if [[ -f "$dir/$file" ]]; then
+      rm -f "$dir/$file"
+      warn "removed $dir/$file left by an earlier version of this script (it held the role token; it is now in $state)"
+    fi
   done
 fi
 [[ -f "$dir/CLAUDE.md" ]] || warn "$dir/CLAUDE.md is missing: put the role Project's own instructions there"
 
 cmd=(claude
   --plugin-dir "$repo/mods/relay-inbox"
-  --settings "$dir/.relay-inbox.json"
-  --mcp-config "$dir/.relay-mcp.json"
-  --append-system-prompt-file "$dir/.relay-instructions.md"
+  --settings "$state/.relay-inbox.json"
+  --mcp-config "$state/.relay-mcp.json"
+  --append-system-prompt-file "$state/.relay-instructions.md"
   --name "relay $role")
 if [[ -n "$model" ]]; then cmd+=(--model "$model"); fi
 if $prompt; then cmd+=("$FIRST_PROMPT"); fi
 cmd+=(${extra[@]+"${extra[@]}"})
 
 if $dry_run; then
-  printf 'role: %s\nrelay: %s\ntoken: from %s (not shown)\nwrote (mode 600): %s/.relay-inbox.json %s/.relay-mcp.json %s/.relay-instructions.md\n' \
-    "$role" "$relay_url" "$token_source" "$dir" "$dir" "$dir"
+  printf 'role: %s\nrelay: %s\ntoken: from %s (not shown)\nwrote (mode 600) in %s: .relay-inbox.json .relay-mcp.json .relay-instructions.md\n' \
+    "$role" "$relay_url" "$token_source" "$state"
   printf 'cd %q &&' "$dir"
   printf ' %q' "${cmd[@]}"
   printf '\n'
@@ -189,6 +217,11 @@ if $dry_run; then
 fi
 
 cd "$dir"
-# The session's tools inherit this environment: leave no relay token in it (its own is in the files above).
+umask "$session_umask"
+# The session's tools inherit this environment. Leave no relay token in it (its own is in the files
+# above), and none of the credentials that could read the other tokens or replace the relay's
+# secrets: 1Password sessions and service-account or Connect tokens, and Cloudflare API tokens.
 unset RELAY_TOKEN ORCHESTRATOR_TOKEN CREATIVE_DIRECTOR_TOKEN DEVELOPER_TOKEN HUMAN_TOKEN
+for var in "${!OP_@}"; do unset "$var"; done
+unset CLOUDFLARE_API_TOKEN CLOUDFLARE_API_KEY CF_API_TOKEN CF_API_KEY
 exec "${cmd[@]}"

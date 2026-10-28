@@ -18,6 +18,8 @@ function engine(on: On) {
     wakes: [] as { id: string; text: string }[],
     requests: [] as { method: string; url: string; authorization?: string }[],
     isDown: false,
+    /** Milliseconds (on the mocked clock) before `GET /spike/wake` answers; its wakes are consumed at once. */
+    wakeDelay: 0,
     submitted: [] as { text: string; origin: string }[],
   }
   const session = { id: 'sess-1', cwd: '/work/project-a' }
@@ -39,7 +41,7 @@ function engine(on: On) {
     relay.submitted.push({ text: e.text, origin: e.origin.kind })
     return { text: e.text, context: e.context }
   })
-  on('http.fetch', (_, e) => {
+  on('http.fetch', async (_, e) => {
     const method = e.init?.method ?? 'GET'
     relay.requests.push({ method, url: e.url, authorization: e.init?.headers?.authorization })
     const answer = (status: number, body: unknown) => ({
@@ -53,7 +55,9 @@ function engine(on: On) {
       return answer(200, { ok: true, result: { event: { id: relay.events.length } } })
     }
     if (url.pathname === '/spike/wake' && method === 'GET') {
-      return answer(200, { ok: true, result: { wakes: relay.wakes.splice(0) } })
+      const wakes = relay.wakes.splice(0)
+      if (relay.wakeDelay > 0) await clock.sleep(relay.wakeDelay)
+      return answer(200, { ok: true, result: { wakes } })
     }
     return answer(404, { ok: false, error: { code: 'not_found', message: 'no route' } })
   })
@@ -250,6 +254,44 @@ test('a wake starts a turn while idle; one that comes during a turn is deferred,
   expect(wakeEvents.find(event => event.event === 'wake.submitted' && event.detail?.wake_id === 'W2')?.detail).toMatchObject({
     deferred_s: 5,
   })
+})
+
+test('a wake poll waits 10 s for its answer; wakes that answer later still are kept and submitted once idle', { options: OPTIONS }, async ($, on) => {
+  const { relay, clock } = engine(on)
+  await $.session.start(START)
+  await clock.settle()
+  const texts = () => relay.submitted.map(prompt => prompt.text)
+
+  // Slower than the 3 s an event POST waits: the wake still runs as usual.
+  relay.wakes.push({ id: 'W1', text: 'Reply with the word awake.' })
+  relay.wakeDelay = 3_500
+  await clock.advance(15_000)
+  await clock.advance(3_500)
+  expect(texts()).toEqual(['Reply with the word awake.'])
+
+  // Slower than 10 s: the relay consumed it all the same, so it is kept (wake.late) and submitted at the next tick.
+  relay.wakes.push({ id: 'W2', text: 'Second wake.' })
+  relay.wakeDelay = 12_000
+  await clock.advance(11_500) // the poll at +30 s
+  expect(relay.wakes).toEqual([])
+  await clock.advance(10_500) // given up on at +40 s
+  expect(texts()).toHaveLength(1)
+  await clock.advance(1_500) // answered at +42 s
+  expect(texts()).toHaveLength(1)
+  await clock.advance(3_000) // the tick at +45 s
+  expect(texts()).toEqual(['Reply with the word awake.', 'Second wake.'])
+  await clock.advance(5_000)
+
+  const wakeEvents = relay.events.filter(event => event.event.startsWith('wake.'))
+  expect(wakeEvents.map(event => [event.event, event.detail?.wake_id])).toEqual([
+    ['wake.submitted', 'W1'],
+    ['wake.turn_started', 'W1'],
+    ['wake.late', 'W2'],
+    ['wake.deferred', 'W2'],
+    ['wake.submitted', 'W2'],
+    ['wake.turn_started', 'W2'],
+  ])
+  expect(wakeEvents.find(event => event.event === 'wake.late')?.detail).toEqual({ wake_id: 'W2', answer_s: 12 })
 })
 
 test('wake polls run every poll_seconds exactly', { options: OPTIONS }, async ($, on) => {

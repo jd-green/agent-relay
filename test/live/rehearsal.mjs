@@ -81,7 +81,7 @@ Rehearsal environment:
 - A static preview server serves that folder at ${base}/ — a file at ${ws}/app/index.html is live at ${base}/app/ and ${ws}/design/spec.md at ${base}/design/spec.md. Use these http URLs as links in messages; the other roles can open them with curl.
 - Design specs live under ${ws}/design/ (Creative Director). The app lives under ${ws}/app/ (Developer). There is no git remote here: writing files under ${ws}/app/ IS deploying the preview, so "deploy only from a pushed commit" does not apply in this rehearsal.
 - Fetch pages with: curl -s <url>. No other network access is needed.
-- James (the human) answers gates and questions through the relay; never wait for him inside a turn.
+- James (the human) answers gates and questions through the relay; never wait for James inside a turn.
 
 --- Project instructions: relay protocol ---
 ${protocol}
@@ -104,6 +104,11 @@ for (const key of Object.keys(childEnv)) {
   if (/^CLAUDE_CODE_(SESSION_ID|REMOTE_SESSION_ID|MESSAGING_|TEE_SDK_STDOUT|DIAGNOSTICS_FILE|CHILD_SESSION|SYNC_SESSION_REFS|POST_FOR_SESSION_INGRESS|CCR_EVENT_FLUSH|REMOTE_SEND_KEEPALIVES|INCLUDE_PARTIAL_MESSAGES)/.test(key) || key === "CLAUDE_PID" || key === "CLAUDECODE") {
     delete childEnv[key];
   }
+}
+// Like scripts/role-session.sh: no relay token, 1Password credential or Cloudflare token reaches the agents.
+const SCRUBBED = ["RELAY_TOKEN", "ORCHESTRATOR_TOKEN", "CREATIVE_DIRECTOR_TOKEN", "DEVELOPER_TOKEN", "HUMAN_TOKEN", "CLOUDFLARE_API_TOKEN", "CLOUDFLARE_API_KEY", "CF_API_TOKEN", "CF_API_KEY"];
+for (const key of Object.keys(childEnv)) {
+  if (key.startsWith("OP_") || SCRUBBED.includes(key)) delete childEnv[key];
 }
 childEnv.NO_PROXY = childEnv.no_proxy = "127.0.0.1,localhost";
 

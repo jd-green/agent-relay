@@ -3,33 +3,53 @@ import { fail } from "./errors";
 interface SecretPattern {
   kind: string;
   pattern: RegExp;
+  /** For formats with a free-form body: the whole match must also look generated, not like a name. */
+  generated?: (match: string) => boolean;
 }
 
+const hasDigit = (text: string) => /[0-9]/.test(text);
+const hasUpper = (text: string) => /[A-Z]/.test(text);
+
 // Lookbehinds keep prefixes inside ordinary words (e.g. "task-…" containing "sk-") from matching.
-// The Anthropic pattern comes before the generic sk- pattern so it is reported by its own name.
-// Every pattern is global: the scanner looks at each match, not just the first.
+// Provider patterns come before the generic sk- pattern so they are reported by their own name.
+// There is no exemption of any kind (1Password references included): every pattern runs on the raw
+// text. Where a key format has a free-form body, the body must also look generated (a digit, an
+// uppercase letter, or a hex run), so identifiers and 1Password item or field names such as
+// "sk-ant-production-api-key", "xoxb-deploy-bot-token" or "rk_live_restricted" never match.
+// Bodies are matched greedily and `generated` checks the whole match, which keeps a scan linear
+// even when one run holds many prefixes ("sk-ant-sk-ant-…").
 const PATTERNS: readonly SecretPattern[] = [
-  { kind: "Anthropic API key", pattern: /(?<![A-Za-z0-9])sk-ant-[A-Za-z0-9_-]{16,}/g },
-  // A known OpenAI prefix, or a body with at least one digit and one uppercase letter, so that
-  // all-lowercase kebab-case identifiers ("sk-loading-skeleton-…") never match.
+  {
+    kind: "Anthropic API key",
+    pattern: /(?<![A-Za-z0-9])sk-ant-[A-Za-z0-9_-]{16,}/g,
+    generated: (match) => hasDigit(match) && hasUpper(match),
+  },
+  { kind: "OpenRouter API key", pattern: /(?<![A-Za-z0-9])sk-or-v1-[0-9a-f]{32,}/g },
+  // A known OpenAI prefix, a lowercase hex body (DeepSeek-style keys), or a body with at least one
+  // digit and one uppercase letter, so that all-lowercase kebab-case identifiers
+  // ("sk-loading-skeleton-…", "sk-learn-model-selection-guide") never match.
   {
     kind: "OpenAI-style API key",
     pattern:
-      /(?<![A-Za-z0-9_-])sk-(?:(?:proj|svcacct|admin)-(?=[A-Za-z0-9_-]*[0-9A-Z])|(?=[A-Za-z0-9_-]*[0-9])(?=[A-Za-z0-9_-]*[A-Z]))[A-Za-z0-9_-]{32,}/g,
+      /(?<![A-Za-z0-9_-])sk-(?:(?:proj|svcacct|admin)-(?=[A-Za-z0-9_-]*[0-9A-Z])[A-Za-z0-9_-]{32,}|[0-9a-f]{32,}(?![A-Za-z0-9_-])|(?=[A-Za-z0-9_-]*[0-9])(?=[A-Za-z0-9_-]*[A-Z])[A-Za-z0-9_-]{32,})/g,
   },
-  { kind: "GitHub token", pattern: /(?<![A-Za-z0-9])(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})/g },
+  { kind: "GitHub token", pattern: /(?<![A-Za-z0-9])gh[pousr]_[A-Za-z0-9]{20,}/g },
+  {
+    kind: "GitHub token",
+    pattern: /(?<![A-Za-z0-9])github_pat_[A-Za-z0-9_]{20,}/g,
+    generated: (match) => hasDigit(match) && hasUpper(match),
+  },
   { kind: "AWS access key id", pattern: /(?<![A-Z0-9])AKIA[0-9A-Z]{16}(?![A-Z0-9])/g },
-  { kind: "Slack token", pattern: /(?<![A-Za-z0-9])xox[abprs]-[A-Za-z0-9-]{10,}/g },
+  { kind: "Slack token", pattern: /(?<![A-Za-z0-9])xox[abprs]-[A-Za-z0-9-]{10,}/g, generated: hasDigit },
   { kind: "Google API key", pattern: /(?<![A-Za-z0-9])AIza[0-9A-Za-z_-]{35}/g },
-  { kind: "Stripe live key", pattern: /(?<![A-Za-z0-9])[rs]k_live_[0-9A-Za-z]{10,}/g },
+  {
+    kind: "Stripe live key",
+    pattern: /(?<![A-Za-z0-9])[rs]k_live_[0-9A-Za-z]{10,}/g,
+    generated: (match) => hasDigit(match) || hasUpper(match),
+  },
   { kind: "private key", pattern: /-----BEGIN [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----/g },
   { kind: "JWT", pattern: /(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/g },
 ];
-
-// 1Password references name a secret without containing it, so a match wholly inside one is allowed.
-// Only the strict form counts: op://<vault>/<item>/<field>[/<section>]. Vault and item names may hold
-// spaces; the last segment may not, so a reference can't swallow the text that follows it.
-const OP_REFERENCE = /op:\/\/[A-Za-z0-9 ._-]+\/[A-Za-z0-9 ._-]+\/(?:[A-Za-z0-9 ._-]+\/)?[A-Za-z0-9._-]+\b/g;
 
 export interface SecretHit {
   kind: string;
@@ -37,13 +57,10 @@ export interface SecretHit {
 }
 
 function scanText(text: string, tokens: readonly string[]): string | null {
-  // Role tokens are checked on the raw text: they never belong in a reference.
   if (tokens.some((token) => text.includes(token))) return "relay role token";
-  const references = [...text.matchAll(OP_REFERENCE)].map((match) => ({ from: match.index, to: match.index + match[0].length }));
-  const inReference = (start: number, end: number) => references.some(({ from, to }) => start >= from && end <= to);
-  for (const { kind, pattern } of PATTERNS) {
-    for (const match of text.matchAll(pattern)) {
-      if (!inReference(match.index, match.index + match[0].length)) return kind;
+  for (const { kind, pattern, generated } of PATTERNS) {
+    for (const [match] of text.matchAll(pattern)) {
+      if (!generated || generated(match)) return kind;
     }
   }
   return null;
