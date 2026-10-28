@@ -1,0 +1,19 @@
+{
+  "name": "agent-relay",
+  "owner": {
+    "name": "James Green"
+  },
+  "description": "Claude Code Mods for Agent Relay: the inbox band and wake path, and the milestone-1 hooks spike.",
+  "plugins": [
+    {
+      "name": "relay-inbox",
+      "source": "./mods/relay-inbox",
+      "description": "Agent Relay inbox band, next-turn message injection, Reply, and auto-wake of an idle session."
+    },
+    {
+      "name": "relay-spike",
+      "source": "./mods/relay-spike",
+      "description": "Agent Relay spike: logs which Mod hooks fire, probes context injection and whether a wake can start a turn."
+    }
+  ]
+}

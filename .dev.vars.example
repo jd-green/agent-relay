@@ -1,0 +1,9 @@
+# Local secrets for `npm run dev`. Create the real file with:  node scripts/gen-dev-vars.mjs
+# A token shorter than 32 characters disables its role, so these placeholders authenticate nothing.
+ORCHESTRATOR_TOKEN=replace-me
+CREATIVE_DIRECTOR_TOKEN=replace-me
+DEVELOPER_TOKEN=replace-me
+HUMAN_TOKEN=replace-me
+
+# Optional: local overrides of the wrangler.jsonc vars, e.g. quicker nudges while testing.
+# NUDGE_AFTER_MINUTES=1

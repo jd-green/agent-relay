@@ -1,0 +1,35 @@
+{
+  "name": "relay-inbox",
+  "version": "0.1.0",
+  "description": "Agent Relay inbox: polls the relay for this role's unread messages, shows them in a band above the prompt with Read and Reply, hands them to the model on the next turn, and wakes an idle session when new ones arrive.",
+  "author": { "name": "James Green" },
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "relay_url": {
+      "type": "string",
+      "title": "Relay URL",
+      "description": "Base URL of the Agent Relay Worker, for example https://agent-relay.<account>.workers.dev",
+      "required": true
+    },
+    "role_token": {
+      "type": "string",
+      "title": "Role token",
+      "description": "Bearer token of the role this session plays: its inbox is read and its replies are sent as that role.",
+      "required": true,
+      "sensitive": true
+    },
+    "poll_seconds": {
+      "type": "number",
+      "title": "Inbox poll interval (seconds)",
+      "description": "How often to check the relay for unread messages. At least 15.",
+      "default": 60,
+      "min": 15
+    },
+    "auto_wake": {
+      "type": "boolean",
+      "title": "Wake an idle session",
+      "description": "When new messages arrive and no turn is running, start a turn that tells the role to check its relay inbox.",
+      "default": true
+    }
+  }
+}

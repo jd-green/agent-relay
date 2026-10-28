@@ -1,0 +1,28 @@
+{
+  "name": "relay-spike",
+  "version": "0.1.0",
+  "description": "Agent Relay spike: reports which Mod hooks fire (event names and small metadata only) to the relay, proves injected context reaches the model, and tests whether a relay wake request can start a turn in an idle session.",
+  "author": { "name": "James Green" },
+  "userConfig": {
+    "relay_url": {
+      "type": "string",
+      "title": "Relay URL",
+      "description": "Base URL of the Agent Relay Worker, for example https://agent-relay.<account>.workers.dev",
+      "required": true
+    },
+    "role_token": {
+      "type": "string",
+      "title": "Role token",
+      "description": "Bearer token of the role this session plays (any role's token is accepted for spike events).",
+      "required": true,
+      "sensitive": true
+    },
+    "poll_seconds": {
+      "type": "number",
+      "title": "Wake poll interval (seconds)",
+      "description": "How often to ask the relay for wake requests. At least 15.",
+      "default": 30,
+      "min": 15
+    }
+  }
+}

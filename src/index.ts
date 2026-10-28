@@ -1,12 +1,8 @@
-import { DurableObject } from "cloudflare:workers";
-import protocol from "../protocol/PROTOCOL.md";
-import page from "./ui/ledger.html";
-export class BuildDO extends DurableObject<Env> {}
-export class RelayDO extends DurableObject<Env> {}
+import { handleRequest } from "./http";
+
+export { BuildDO } from "./build-do";
+export { RelayDO } from "./relay-do";
+
 export default {
-  async fetch(req: Request) {
-    const u = new URL(req.url);
-    if (u.pathname === "/") return new Response(page, { headers: { "content-type": "text/html" } });
-    return new Response(protocol);
-  },
+  fetch: (request, env) => handleRequest(request, env),
 } satisfies ExportedHandler<Env>;
