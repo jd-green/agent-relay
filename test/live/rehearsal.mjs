@@ -9,6 +9,7 @@
 // answers gates and questions). Everything the agents do goes through the relay.
 //
 //   RUN_LIVE=1 node test/live/rehearsal.mjs [--model sonnet] [--minutes 45] [--max-invocations 40] [--out <dir>]
+//                                           [--nudge <minutes>] [--title <build title> --brief-file <file>]
 //
 // It costs real model usage. Output: <out>/report.md, report.json, ws/ (the app), logs/.
 import { spawn } from "node:child_process";
@@ -31,6 +32,8 @@ const { values: opts } = parseArgs({
     "max-invocations": { type: "string", default: "40" },
     out: { type: "string" },
     nudge: { type: "string", default: "4" },
+    title: { type: "string", default: "Split the bill" },
+    "brief-file": { type: "string" },
   },
 });
 if (process.env.RUN_LIVE !== "1") {
@@ -185,12 +188,13 @@ async function unreadFor(role) {
 }
 
 // --- kickoff ------------------------------------------------------------------------
-const BRIEF = `Build a small single-page "Split the bill" tip calculator web app.
+const DEFAULT_BRIEF = `Build a small single-page "Split the bill" tip calculator web app.
 - Inputs: bill amount, tip percentage (quick picks 15 / 18 / 20 % plus custom), number of people (stepper, min 1).
 - Output: tip amount, total, and per-person amount, updating live as inputs change; a Reset button.
 - Plain static HTML/CSS/JS, no build step, no external requests; mobile-first, works at 360 px wide, accessible (labels, focus states, contrast).
 - One screen is enough. Keep the plan small: this is a rehearsal of the team loop, not a big project.`;
-const created = await relay.call("human", "build_create", { title: "Split the bill", brief: BRIEF });
+const BRIEF = opts["brief-file"] ? readFileSync(opts["brief-file"], "utf8") : DEFAULT_BRIEF;
+const created = await relay.call("human", "build_create", { title: opts.title, brief: BRIEF });
 if (!created.ok) throw new Error(`build_create failed: ${JSON.stringify(created.error)}`);
 const buildId = created.result.build_id;
 touchpoints.push({ at: since(), kind: "kickoff", detail: buildId });
@@ -233,9 +237,25 @@ try {
   const report = buildReport(ledger);
   writeFileSync(join(out, "report.json"), JSON.stringify({ report, ledger, touchpoints, state }, null, 2));
   writeFileSync(join(out, "report.md"), renderReport(report, ledger));
+  await screenshotApp().catch((e) => say(`no app screenshot: ${e.message}`));
   say(`report: ${join(out, "report.md")}`);
   await relay.stop();
   preview.close();
+}
+
+// Best effort: a phone-width screenshot of the preview, when Playwright is installed.
+async function screenshotApp() {
+  const { createRequire } = await import("node:module");
+  const { chromium } = createRequire(import.meta.url)("playwright");
+  const browser = await chromium.launch();
+  try {
+    const page = await browser.newPage({ viewport: { width: 390, height: 844 } });
+    await page.goto(`${base}/app/`);
+    await page.screenshot({ path: join(out, "app.png"), fullPage: true });
+    say(`app screenshot: ${join(out, "app.png")}`);
+  } finally {
+    await browser.close();
+  }
 }
 
 function buildReport(ledger) {
