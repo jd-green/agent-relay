@@ -1,0 +1,23 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "agent-relay",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-01",
+  "observability": { "enabled": true },
+  "rules": [{ "type": "Text", "globs": ["**/*.md", "**/*.html"], "fallthrough": true }],
+  "vars": {
+    "HUMAN_NAME": "James",
+    "NUDGE_AFTER_MINUTES": "30",
+    "MAX_MESSAGES_PER_BUILD": "200",
+    "MAX_REVIEW_ROUNDS": "3",
+    "BURST_PER_MINUTE": "10",
+    "MAX_ACTIVE_BUILDS": "1"
+  },
+  "durable_objects": {
+    "bindings": [
+      { "name": "BUILD", "class_name": "BuildDO" },
+      { "name": "RELAY", "class_name": "RelayDO" }
+    ]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["BuildDO", "RelayDO"] }]
+}
