@@ -8,3 +8,8 @@ dist/
 *.log
 .DS_Store
 coverage/
+
+# Written by scripts/role-session.sh (hold role tokens)
+.relay-inbox.json
+.relay-mcp.json
+.relay-instructions.md

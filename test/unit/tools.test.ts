@@ -1,0 +1,433 @@
+import { runInDurableObject } from "cloudflare:test";
+import { describe, expect, it } from "vitest";
+import {
+  buildSql,
+  buildStub,
+  call,
+  callRaw,
+  createBuild,
+  createTask,
+  expectError,
+  inProgressBuild,
+  ledger,
+  relaySql,
+  relayStub,
+  runAlarm,
+  useCleanState,
+  type Json,
+  type Role,
+} from "./helpers";
+
+useCleanState();
+
+const AGENTS: Role[] = ["orchestrator", "creative-director", "developer"];
+
+describe("whoami", () => {
+  it("describes the caller and the role directory", async () => {
+    const me = await call("creative-director", "whoami");
+    expect(me).toMatchObject({
+      role: "creative-director",
+      display_name: "Creative Director",
+      halted: { global: false, reason: null, at: null },
+      version: "0.1.0",
+    });
+    expect(me.roles).toEqual([
+      { id: "orchestrator", display_name: "Orchestrator", aliases: ["orch"], enabled: true },
+      { id: "creative-director", display_name: "Creative Director", aliases: ["cd", "creative"], enabled: true },
+      { id: "developer", display_name: "Full-Stack Developer", aliases: ["full-stack-developer", "dev"], enabled: true },
+      { id: "human", display_name: "James", aliases: ["james"], enabled: true },
+    ]);
+  });
+});
+
+describe("build_create", () => {
+  it("creates a planning build and sends the brief to the orchestrator when James creates it", async () => {
+    const build = await createBuild({ caps: { max_messages: 50 } });
+    expect(build.build_id).toMatch(/^b-[a-z2-7]{10}$/);
+    expect(build).toMatchObject({
+      title: "Tip calculator",
+      brief: "Build a tip calculator web app.",
+      status: "planning",
+      gates: { plan_approval: true, final_signoff: true },
+      caps: { max_messages: 50, max_review_rounds: 3 },
+      message_count: 0,
+      created_by: "human",
+    });
+    const inbox = await call("orchestrator", "inbox", { build_id: build.build_id });
+    expect(inbox.builds[0].messages).toEqual([
+      expect.objectContaining({
+        id: "M1",
+        seq: 1,
+        from: "human",
+        to: "orchestrator",
+        type: "task",
+        task_id: null,
+        body: "Build a tip calculator web app.",
+      }),
+    ]);
+  });
+
+  it("sends no kickoff when the orchestrator creates the build", async () => {
+    const build = await call("orchestrator", "build_create", { title: "Self-started", brief: "x", gates: { final_signoff: true } });
+    expect(build.created_by).toBe("orchestrator");
+    expect(build.gates).toEqual({ plan_approval: true, final_signoff: true });
+    expect((await ledger(build.build_id)).messages).toEqual([]);
+  });
+
+  it("gives an orchestrator-created build both gates and caps no higher than the defaults", async () => {
+    for (const gates of [{ plan_approval: false }, { final_signoff: false }]) {
+      const message = await expectError("orchestrator", "build_create", { title: "x", brief: "y", gates }, "forbidden");
+      expect(message).toContain("only James may turn gates off");
+    }
+    for (const caps of [{ max_messages: 201 }, { max_review_rounds: 4 }]) {
+      const message = await expectError("orchestrator", "build_create", { title: "x", brief: "y", caps }, "forbidden");
+      expect(message).toContain("caps may only be lowered");
+    }
+    expect((await call("human", "build_list", { include_closed: true })).builds).toEqual([]);
+    const lowered = await call("orchestrator", "build_create", { title: "x", brief: "y", caps: { max_messages: 50, max_review_rounds: 3 } });
+    expect(lowered).toMatchObject({ gates: { plan_approval: true, final_signoff: true }, caps: { max_messages: 50, max_review_rounds: 3 } });
+    await call("human", "build_control", { build_id: lowered.build_id, action: "cancel" });
+    // The human may do either.
+    const open = await createBuild({ gates: { plan_approval: false, final_signoff: false }, caps: { max_messages: 1000, max_review_rounds: 10 } });
+    expect(open).toMatchObject({ gates: { plan_approval: false, final_signoff: false }, caps: { max_messages: 1000, max_review_rounds: 10 } });
+  });
+
+  it("is refused to other roles", async () => {
+    for (const role of ["creative-director", "developer"] as const) {
+      await expectError(role, "build_create", { title: "x", brief: "y" }, "forbidden");
+    }
+  });
+
+  it("validates input", async () => {
+    await expectError("human", "build_create", { title: "", brief: "y" }, "invalid_input");
+    await expectError("human", "build_create", { title: "x" }, "invalid_input");
+    await expectError("human", "build_create", { title: "x", brief: "y", caps: { max_messages: 0 } }, "invalid_input");
+  });
+});
+
+describe("MAX_ACTIVE_BUILDS", () => {
+  it("allows one active build; shipping or cancelling frees the slot", async () => {
+    const first = await createBuild({ gates: { plan_approval: false, final_signoff: false } });
+    const message = await expectError("human", "build_create", { title: "Second", brief: "x" }, "conflict");
+    expect(message).toContain(first.build_id);
+
+    // A halted build is still active.
+    await call("human", "build_control", { build_id: first.build_id, action: "halt" });
+    await expectError("orchestrator", "build_create", { title: "Second", brief: "x" }, "conflict");
+    await call("human", "build_control", { build_id: first.build_id, action: "cancel" });
+    const second = await createBuild({ title: "Second", gates: { plan_approval: false, final_signoff: false } });
+
+    // Shipping also frees the slot.
+    const taskId = await createTask(second.build_id, { reviewer: null });
+    await call("orchestrator", "gate_request", { build_id: second.build_id, kind: "plan_approval", summary: "Plan" });
+    await call("developer", "ledger_update", { build_id: second.build_id, task_id: taskId, status: "done" });
+    const shipped = await call("orchestrator", "gate_request", { build_id: second.build_id, kind: "final_signoff", summary: "Done" });
+    expect(shipped.build.status).toBe("shipped");
+    await createBuild({ title: "Third" });
+  });
+});
+
+describe("concurrent build_create", () => {
+  it("admits exactly one build when MAX_ACTIVE_BUILDS is 1", async () => {
+    const results = await Promise.all(
+      [1, 2, 3].map((i) => callRaw("human", "build_create", { title: `Race ${i}`, brief: "x" })),
+    );
+    expect(results.filter((result) => result.body.ok)).toHaveLength(1);
+    expect(results.filter((result) => result.body.error?.code === "conflict")).toHaveLength(2);
+    expect((await call("human", "build_list", { include_closed: true })).builds).toHaveLength(1);
+  });
+});
+
+describe("build_list", () => {
+  it("lists summaries for every role and hides closed builds by default", async () => {
+    const { buildId, taskId } = await inProgressBuild();
+    for (const role of [...AGENTS, "human"] as Role[]) {
+      const { builds } = await call(role, "build_list");
+      expect(builds).toHaveLength(1);
+      expect(builds[0]).toMatchObject({
+        build_id: buildId,
+        title: "Tip calculator",
+        status: "in_progress",
+        halt_reason: null,
+        owners: [{ task_id: taskId, title: "Main screen", owner: "developer", status: "todo" }],
+        pending_gates: [],
+      });
+      // The plan gate is off, so the last message is the relay's auto-approval notice.
+      expect(builds[0].last_message).toMatchObject({ id: "M2", from: "relay", to: "orchestrator", type: "status" });
+    }
+    await call("human", "build_control", { build_id: buildId, action: "cancel" });
+    expect((await call("developer", "build_list")).builds).toEqual([]);
+    const all = await call("developer", "build_list", { include_closed: true });
+    expect(all.builds[0]).toMatchObject({ status: "cancelled", owners: [] });
+  });
+
+  it("shows pending gates and keeps the summary current after each change", async () => {
+    const build = await createBuild();
+    await createTask(build.build_id);
+    await call("orchestrator", "gate_request", { build_id: build.build_id, kind: "plan_approval", summary: "Plan v1" });
+    const { builds } = await call("human", "build_list");
+    expect(builds[0].status).toBe("awaiting_plan_approval");
+    expect(builds[0].pending_gates).toEqual([expect.objectContaining({ id: "G1", kind: "plan_approval", status: "pending" })]);
+    expect(builds[0].last_message).toMatchObject({ from: "relay", to: "human", type: "question" });
+    expect(builds[0].last_message.excerpt.length).toBeLessThanOrEqual(140);
+  });
+
+  it("retries a failed summary push from the alarm, so a closed build never stays active in the registry", async () => {
+    const { buildId } = await inProgressBuild();
+    // RelayDO can't store summaries for a moment.
+    await relaySql("ALTER TABLE builds RENAME TO builds_away");
+    const before = Date.now();
+    await call("human", "build_control", { build_id: buildId, action: "cancel" });
+    await relaySql("ALTER TABLE builds_away RENAME TO builds");
+
+    const [{ summary_dirty }] = (await buildSql(buildId, "SELECT summary_dirty FROM local_state")) as Json[];
+    expect(summary_dirty).toBe(1);
+    const alarm = await runInDurableObject(buildStub(buildId), (_instance, state) => state.storage.getAlarm());
+    expect(alarm).toBeGreaterThan(before);
+    expect(alarm).toBeLessThanOrEqual(Date.now() + 60_000);
+    // Still "in_progress" in the registry, which blocks the one active-build slot.
+    await expectError("human", "build_create", { title: "Next", brief: "x" }, "conflict");
+
+    expect(await runAlarm(buildId)).toBe(true);
+    const [row] = (await relaySql("SELECT status FROM builds WHERE build_id = ?", buildId)) as Json[];
+    expect(row.status).toBe("cancelled");
+    expect(((await buildSql(buildId, "SELECT summary_dirty FROM local_state")) as Json[])[0].summary_dirty).toBe(0);
+    await createBuild({ title: "Next" });
+  });
+
+  it("keeps retrying from the alarm while RelayDO can't even be read", async () => {
+    const { buildId } = await inProgressBuild();
+    await relaySql("ALTER TABLE builds RENAME TO builds_away");
+    await call("human", "build_control", { build_id: buildId, action: "cancel" });
+    // Now the alarm's kill switch read fails too.
+    await relaySql("ALTER TABLE kill_switch RENAME TO kill_switch_away");
+    const alarmAt = () => runInDurableObject(buildStub(buildId), (_instance, state) => state.storage.getAlarm());
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const before = Date.now();
+      expect(await runAlarm(buildId)).toBe(true); // the alarm itself doesn't throw…
+      const next = await alarmAt();
+      expect(next).toBeGreaterThan(before); // …and always re-arms the retry
+      expect(next).toBeLessThanOrEqual(Date.now() + 60_000);
+      expect(((await buildSql(buildId, "SELECT summary_dirty FROM local_state")) as Json[])[0].summary_dirty).toBe(1);
+    }
+    await relaySql("ALTER TABLE kill_switch_away RENAME TO kill_switch");
+    await relaySql("ALTER TABLE builds_away RENAME TO builds");
+    await runAlarm(buildId);
+    const [row] = (await relaySql("SELECT status FROM builds WHERE build_id = ?", buildId)) as Json[];
+    expect(row.status).toBe("cancelled");
+    expect(((await buildSql(buildId, "SELECT summary_dirty FROM local_state")) as Json[])[0].summary_dirty).toBe(0);
+    expect(await alarmAt()).toBeNull();
+  });
+});
+
+describe("storage written by the previous version", () => {
+  it("is migrated when a Durable Object starts: new tables and columns are added, nothing is lost", async () => {
+    const { buildId, taskId } = await inProgressBuild();
+    await call("human", "build_control", { build_id: buildId, action: "halt" }); // something to keep
+    // Roll the build back to the v1 schema, then run the constructor's migration on the live instance.
+    await runInDurableObject(buildStub(buildId), (instance, state) => {
+      const sql = state.storage.sql;
+      sql.exec("DROP TABLE writes");
+      sql.exec("DROP TABLE local_state");
+      sql.exec("DROP TABLE notices");
+      sql.exec("ALTER TABLE messages DROP COLUMN next_task_id");
+      sql.exec("ALTER TABLE build DROP COLUMN write_count");
+      (instance as unknown as { migrate(): void }).migrate();
+    });
+    await call("human", "build_control", { build_id: buildId, action: "resume" });
+    const { task } = await call("developer", "ledger_update", { build_id: buildId, task_id: taskId, status: "blocked" });
+    expect(task).toMatchObject({ status: "blocked", ready: true });
+    const migrated = await ledger(buildId);
+    expect(migrated.messages[0]).toMatchObject({ id: "M1", next_task_id: null });
+    expect(migrated.build.write_count).toBe(1);
+    expect(migrated.messages.at(-1).body).toBe("T1 is blocked (developer).");
+    expect(await buildSql(buildId, "SELECT global_halted, kill_epoch FROM local_state")).toEqual([{ global_halted: 0, kill_epoch: 0 }]);
+
+    // A local_state table from the first fix round (no kill_epoch yet) gains the column.
+    await runInDurableObject(buildStub(buildId), (instance, state) => {
+      state.storage.sql.exec("ALTER TABLE local_state DROP COLUMN kill_epoch");
+      (instance as unknown as { migrate(): void }).migrate();
+    });
+    expect(await buildSql(buildId, "SELECT kill_epoch FROM local_state")).toEqual([{ kill_epoch: 0 }]);
+
+    await runInDurableObject(relayStub(), (instance, state) => {
+      const sql = state.storage.sql;
+      sql.exec("ALTER TABLE wakes DROP COLUMN role");
+      sql.exec("ALTER TABLE kill_switch DROP COLUMN epoch");
+      sql.exec("ALTER TABLE kill_switch DROP COLUMN cleared");
+      sql.exec("ALTER TABLE builds DROP COLUMN kill_epoch");
+      (instance as unknown as { migrate(): void }).migrate();
+    });
+    const columns = async (table: string) => ((await relaySql(`SELECT name FROM pragma_table_info('${table}')`)) as Json[]).map((c) => c.name);
+    expect(await columns("wakes")).toContain("role");
+    expect(await columns("kill_switch")).toEqual(expect.arrayContaining(["epoch", "cleared"]));
+    expect(await columns("builds")).toContain("kill_epoch");
+    // The switch keeps working on the migrated rows.
+    await call("human", "kill_switch", { on: true, reason: "After migration" });
+    expect(await buildSql(buildId, "SELECT global_halted FROM local_state")).toEqual([{ global_halted: 1 }]);
+  });
+});
+
+describe("ledger_get", () => {
+  it("returns the whole ledger to every role", async () => {
+    const { buildId } = await inProgressBuild();
+    for (const role of [...AGENTS, "human"] as Role[]) {
+      const snapshot = await call(role, "ledger_get", { build_id: buildId });
+      expect(Object.keys(snapshot)).toEqual(["build", "tasks", "gates", "verdicts", "messages", "threads", "audit"]);
+      expect(snapshot.build.status).toBe("in_progress");
+      expect(snapshot.tasks).toHaveLength(1);
+      expect(snapshot.gates[0]).toMatchObject({ kind: "plan_approval", status: "approved", auto: true });
+    }
+  });
+
+  it("caps messages and audit at the last 50, oldest first", async () => {
+    const build = await createBuild();
+    for (let i = 0; i < 55; i += 1) {
+      await call("human", "send", { build_id: build.build_id, to_role: "orchestrator", type: "status", body: `note ${i}` });
+    }
+    const snapshot = await ledger(build.build_id);
+    expect(snapshot.messages).toHaveLength(50);
+    expect(snapshot.messages[0].seq).toBe(7);
+    expect(snapshot.messages.at(-1).seq).toBe(56);
+    expect(snapshot.audit).toHaveLength(50);
+    expect(snapshot.audit[0].seq).toBeLessThan(snapshot.audit.at(-1).seq);
+  });
+
+  it("answers not_found for an unknown build and invalid_input for a malformed id", async () => {
+    await expectError("developer", "ledger_get", { build_id: "b-zzzzzzzzzz" }, "not_found");
+    await expectError("developer", "ledger_get", { build_id: "B-1" }, "invalid_input");
+  });
+});
+
+describe("human-only tools", () => {
+  it("refuse every agent role", async () => {
+    const { buildId } = await inProgressBuild();
+    for (const role of AGENTS) {
+      await expectError(role, "gate_decide", { build_id: buildId, gate_id: "G1", decision: "approved" }, "forbidden");
+      await expectError(role, "build_control", { build_id: buildId, action: "halt" }, "forbidden");
+      await expectError(role, "kill_switch", { on: true }, "forbidden");
+    }
+    for (const role of ["creative-director", "developer"] as const) {
+      await expectError(role, "gate_request", { build_id: buildId, kind: "final_signoff", summary: "x" }, "forbidden");
+    }
+  });
+});
+
+describe("send", () => {
+  it("returns the message (and the task when one is referenced)", async () => {
+    const { buildId, taskId } = await inProgressBuild();
+    const result = await call("developer", "send", {
+      build_id: buildId,
+      to_role: "Creative Director",
+      type: "question",
+      body: "Which palette?",
+      task_id: taskId,
+      links: [{ url: "https://figma.example.com/file/1" }],
+    });
+    expect(result.message).toMatchObject({
+      id: "M3",
+      seq: 3,
+      build_id: buildId,
+      from: "developer",
+      to: "creative-director",
+      type: "question",
+      task_id: taskId,
+      next_task_id: null,
+      body: "Which palette?",
+      links: [{ url: "https://figma.example.com/file/1" }],
+      verdict: null,
+      changes: null,
+      reply_to: null,
+      on_behalf_of: null,
+      read_at: null,
+    });
+    expect(result.message.created_at).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/);
+    expect(result.task.id).toBe(taskId);
+
+    const reply = await call("creative-director", "send", {
+      build_id: buildId,
+      to_role: "dev",
+      type: "status",
+      body: "Use the brand palette.",
+      reply_to: result.message.id,
+    });
+    expect(reply.message.reply_to).toBe("M3");
+    expect(reply.task).toBeUndefined();
+  });
+
+  it("validates recipients, references and fields", async () => {
+    const { buildId, taskId } = await inProgressBuild();
+    const base = { build_id: buildId, type: "status", body: "hi" };
+    await expectError("developer", "send", { ...base, to_role: "qa" }, "invalid_input");
+    await expectError("developer", "send", { ...base, to_role: "dev" }, "invalid_input");
+    await expectError("developer", "send", { ...base, to_role: "cd", reply_to: "M99" }, "not_found");
+    await expectError("developer", "send", { ...base, to_role: "cd", task_id: "T9" }, "not_found");
+    await expectError("developer", "send", { ...base, to_role: "cd", verdict: "approved" }, "invalid_input");
+    await expectError("developer", "send", { ...base, to_role: "cd", body: "" }, "invalid_input");
+    await expectError("developer", "send", { ...base, to_role: "cd", body: "x".repeat(20_001) }, "invalid_input");
+    await expectError("developer", "send", { ...base, to_role: "cd", links: [{ url: "ftp://example.com/a" }] }, "invalid_input");
+    await expectError("developer", "send", { ...base, to_role: "cd", links: [{ url: "javascript:alert(1)" }] }, "invalid_input");
+    const tooMany = Array.from({ length: 21 }, (_, i) => ({ url: `https://example.com/${i}` }));
+    await expectError("developer", "send", { ...base, to_role: "cd", links: tooMany }, "invalid_input");
+    await expectError(
+      "creative-director",
+      "send",
+      { ...base, to_role: "dev", type: "verdict", task_id: taskId, verdict: "changes_requested", changes: [] },
+      "invalid_input",
+    );
+  });
+
+  it("enforces who may send each work type", async () => {
+    const { buildId, taskId } = await inProgressBuild();
+    const base = { build_id: buildId, body: "x", task_id: taskId };
+    const preview = [{ url: "https://preview.example.com" }];
+    await expectError("developer", "send", { ...base, to_role: "cd", type: "task" }, "forbidden");
+    await expectError("creative-director", "send", { ...base, to_role: "dev", type: "handoff" }, "forbidden");
+    await expectError("creative-director", "send", { ...base, to_role: "dev", type: "review_request", links: preview }, "forbidden");
+    await expectError(
+      "developer",
+      "send",
+      { ...base, to_role: "cd", type: "verdict", verdict: "approved" },
+      "forbidden",
+    );
+    // The orchestrator may hand off any task; only the human may send a task message without a task_id.
+    const handoff = await call("orchestrator", "send", { ...base, to_role: "cd", type: "handoff", links: preview });
+    expect(handoff.task).toMatchObject({ assignee: "creative-director", owner: "creative-director", status: "todo", artifacts: preview });
+    await expectError("orchestrator", "send", { build_id: buildId, body: "x", to_role: "dev", type: "task" }, "invalid_input");
+    const kickoff = await call("human", "send", { build_id: buildId, body: "x", to_role: "orchestrator", type: "task" });
+    expect(kickoff.message.task_id).toBeNull();
+  });
+
+  it("assigns a task with a task message", async () => {
+    const { buildId, taskId } = await inProgressBuild();
+    const { task } = await call("orchestrator", "send", {
+      build_id: buildId,
+      to_role: "creative-director",
+      type: "task",
+      task_id: taskId,
+      body: "Design the main screen first.",
+    });
+    expect(task).toMatchObject({ assignee: "creative-director", owner: "creative-director", status: "todo" });
+  });
+
+  it("refuses work on closed tasks", async () => {
+    const { buildId, taskId } = await inProgressBuild();
+    await call("orchestrator", "ledger_update", { build_id: buildId, task_id: taskId, status: "cancelled" });
+    await expectError("orchestrator", "send", { build_id: buildId, to_role: "dev", type: "task", task_id: taskId, body: "x" }, "conflict");
+    await expectError("orchestrator", "send", { build_id: buildId, to_role: "dev", type: "handoff", task_id: taskId, body: "x" }, "conflict");
+  });
+
+  it("creates the recipient's thread on the first message", async () => {
+    const { buildId } = await inProgressBuild();
+    await call("developer", "send", { build_id: buildId, to_role: "cd", type: "status", body: "hello" });
+    const { threads } = await ledger(buildId);
+    expect(threads.map((thread: Json) => thread.thread_key)).toEqual([`${buildId}/orchestrator`, `${buildId}/creative-director`]);
+    expect(threads[1]).toMatchObject({ role: "creative-director", session_ref: null, last_polled_at: null });
+  });
+
+  it("is refused on unknown builds", async () => {
+    await expectError("developer", "send", { build_id: "b-aaaaaaaaaa", to_role: "cd", type: "status", body: "x" }, "not_found");
+    const { body } = await callRaw("developer", "send", { build_id: "b-aaaaaaaaaa", to_role: "cd", type: "status", body: "x" });
+    expect(body.error.message).toContain("build not found");
+  });
+});
