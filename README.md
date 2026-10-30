@@ -2,7 +2,7 @@
 
 Cross-project agent collaboration for Claude Projects. A small remote MCP server (Cloudflare Workers + Durable Objects) lets role agents in separate Claude Projects hand work to each other, track it in a shared ledger, and loop James in only at chosen gates.
 
-**Status:** the v1 relay is built: MCP server, ledger, typed messages, review loop, nudges, loop caps, kill switch, ledger page, the inbox and spike Mods, and the protocol snippet. The wake-up spike (milestone 1) is still to run on James's machine; it decides whether roles stay in their Projects (Plan A) or run as local Claude Code sessions (Plan B).
+**Status:** the v1 relay is built: MCP server, ledger, typed messages, review loop, nudges, loop caps, kill switch, ledger page, the inbox and spike Mods, and the protocol snippet. The relay is deployed. The wake-up spike (milestone 1) is complete for Max-accessible surfaces: **Plan B** (local Claude Code role sessions) is the chosen path. Hooks, marker injection, idle wakes and queued wakes after resume passed; the hourly cloud task also ran unattended, outside a Project. Test plugins/tasks are removed. Evidence, cloud limits and untested device rows are in [`docs/SPIKE.md`](docs/SPIKE.md#results).
 
 - PRD: [`docs/PRD.md`](docs/PRD.md) (source: Claude artifact "Agent Relay — Cross-Project Agent Collaboration PRD", Oct 28, 2026)
 - Design contract: [`docs/DESIGN.md`](docs/DESIGN.md)
