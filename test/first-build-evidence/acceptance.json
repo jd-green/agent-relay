@@ -1,0 +1,164 @@
+{
+  "checks": [
+    {
+      "name": "empty state",
+      "passed": true,
+      "observed": true
+    },
+    {
+      "name": "add mode hides delete and finished date",
+      "passed": true,
+      "observed": true
+    },
+    {
+      "name": "blank title rejected and focused",
+      "passed": true,
+      "observed": true
+    },
+    {
+      "name": "add saved and listed",
+      "passed": true,
+      "observed": true
+    },
+    {
+      "name": "finished date visible and defaults today",
+      "passed": true,
+      "observed": true
+    },
+    {
+      "name": "reading clears finished date",
+      "passed": true,
+      "observed": true
+    },
+    {
+      "name": "newest first",
+      "passed": true,
+      "observed": true
+    },
+    {
+      "name": "both books survive reload",
+      "passed": true,
+      "observed": true
+    },
+    {
+      "name": "reading filter",
+      "passed": true,
+      "observed": true
+    },
+    {
+      "name": "finished filter and date",
+      "passed": true,
+      "observed": true
+    },
+    {
+      "name": "no mobile overflow",
+      "passed": true,
+      "observed": true
+    },
+    {
+      "name": "edit prefilled",
+      "passed": true,
+      "observed": true
+    },
+    {
+      "name": "edit persisted",
+      "passed": true,
+      "observed": true
+    },
+    {
+      "name": "edit survives reload",
+      "passed": true,
+      "observed": true
+    },
+    {
+      "name": "cancel discards edit",
+      "passed": true,
+      "observed": true
+    },
+    {
+      "name": "delete asks confirmation",
+      "passed": true,
+      "observed": true
+    },
+    {
+      "name": "escape cancels delete and returns focus",
+      "passed": true,
+      "observed": true
+    },
+    {
+      "name": "keep book cancels delete",
+      "passed": true,
+      "observed": true
+    },
+    {
+      "name": "confirmed delete removes book",
+      "passed": true,
+      "observed": true
+    },
+    {
+      "name": "delete persists after reload",
+      "passed": true,
+      "observed": true
+    },
+    {
+      "name": "filtered empty state",
+      "passed": true,
+      "observed": true
+    },
+    {
+      "name": "unknown id",
+      "passed": true,
+      "observed": true
+    },
+    {
+      "name": "no external requests",
+      "passed": true,
+      "observed": true
+    },
+    {
+      "name": "storage failure does not discard the form",
+      "passed": true,
+      "observed": true
+    },
+    {
+      "name": "update failure shows alert and keeps stored book",
+      "passed": true,
+      "observed": true
+    },
+    {
+      "name": "retry after update fault saves",
+      "passed": true,
+      "observed": true
+    },
+    {
+      "name": "add failure retains form and saves no new book",
+      "passed": true,
+      "observed": true
+    },
+    {
+      "name": "delete failure keeps confirm and book with alert",
+      "passed": true,
+      "observed": true
+    },
+    {
+      "name": "retry after delete fault removes book",
+      "passed": true,
+      "observed": true
+    }
+  ],
+  "network_urls": [
+    "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIxNiIgaGVpZ2h0PSIxNSIgdmlld0JveD0iMCAwIDI0IDI0Ij48cGF0aCBmaWxsPSJXaW5kb3dUZXh0IiBkPSJNMjAgM2gtMVYxaC0ydjJIN1YxSDV2Mkg0Yy0xLjEgMC0yIC45LTIgMnYxNmMwIDEuMS45IDIgMiAyaDE2YzEuMSAwIDItLjkgMi0yVjVjMC0xLjEtLjktMi0yLTJ6bTAgMThINFY4aDE2djEzeiIvPjxwYXRoIGZpbGw9Im5vbmUiIGQ9Ik0wIDBoMjR2MjRIMHoiLz48L3N2Zz4=",
+    "http://127.0.0.1:8830/app/app.js",
+    "http://127.0.0.1:8830/app/edit.html",
+    "http://127.0.0.1:8830/app/edit.html?id=bmw40ebk7k25u39",
+    "http://127.0.0.1:8830/app/edit.html?id=bmw40ebzogn91ym",
+    "http://127.0.0.1:8830/app/edit.html?id=missing-qa-id",
+    "http://127.0.0.1:8830/app/edit.js",
+    "http://127.0.0.1:8830/app/index.html",
+    "http://127.0.0.1:8830/app/store.js",
+    "http://127.0.0.1:8830/app/styles.css"
+  ],
+  "runtime_errors": [],
+  "passed": 29,
+  "total": 29
+}

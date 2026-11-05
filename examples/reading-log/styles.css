@@ -1,0 +1,105 @@
+/* Reading Log shared styles (design reference; developer may copy to app/styles.css as-is). System fonts only, no external requests. */
+:root {
+  --bg: #faf8f4;
+  --surface: #ffffff;
+  --text: #1f2933;        /* 14.6:1 on bg */
+  --muted: #52606d;       /* 6.3:1 on surface */
+  --border: #cbd2d9;      /* decorative dividers */
+  --control-border: #7b8794; /* 3.6:1 on surface (non-text 3:1) */
+  --primary: #1d4ed8;     /* 6.7:1 on white; white text on it 6.7:1 */
+  --primary-hover: #1e40af;
+  --danger: #b42318;      /* 6.5:1 on white */
+  --danger-hover: #912018;
+  --danger-bg: #fef3f2;
+  --reading-bg: #fef3c7; --reading-fg: #7a4b00;   /* 6.5:1 */
+  --finished-bg: #dcfce7; --finished-fg: #14532d; /* 8.6:1 */
+  --focus: #1d4ed8;
+
+  --font: system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  --fs-title: 1.5rem;   /* 24px, 700, lh 1.25 */
+  --fs-h2: 1.0625rem;   /* 17px, 600, lh 1.3 (book title) */
+  --fs-body: 1rem;      /* 16px, 400, lh 1.5 */
+  --fs-small: 0.875rem; /* 14px, lh 1.4 */
+
+  --s1: 4px; --s2: 8px; --s3: 12px; --s4: 16px; --s5: 24px; --s6: 32px;
+  --radius: 8px; --radius-pill: 999px;
+  --shadow: 0 1px 2px rgba(31, 41, 51, .08);
+  --tap: 44px; /* min target height */
+}
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+html { -webkit-text-size-adjust: 100%; }
+body { margin: 0; background: var(--bg); color: var(--text); font: 400 var(--fs-body)/1.5 var(--font); }
+.wrap { max-width: 640px; margin: 0 auto; padding: var(--s4); }
+@media (min-width: 640px) { .wrap { padding: var(--s6) var(--s5); } }
+
+h1 { font-size: var(--fs-title); line-height: 1.25; font-weight: 700; margin: 0; }
+.page-head { display: flex; align-items: center; justify-content: space-between; gap: var(--s3); margin-bottom: var(--s4); }
+
+/* Focus: always visible, 3px ring with gap */
+a:focus-visible, button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible {
+  outline: 3px solid var(--focus); outline-offset: 2px;
+}
+
+/* Buttons */
+.btn { display: inline-flex; align-items: center; justify-content: center; min-height: var(--tap); padding: 0 var(--s4);
+  border-radius: var(--radius); border: 2px solid transparent; font: 600 var(--fs-body)/1 var(--font); text-decoration: none; cursor: pointer; }
+.btn-primary { background: var(--primary); color: #fff; }
+.btn-primary:hover { background: var(--primary-hover); }
+.btn-secondary { background: var(--surface); color: var(--primary); border-color: var(--primary); }
+.btn-secondary:hover { background: #eff4ff; }
+.btn-danger { background: var(--surface); color: var(--danger); border-color: var(--danger); }
+.btn-danger:hover { background: var(--danger-bg); }
+.btn-danger-solid { background: var(--danger); color: #fff; }
+.btn-danger-solid:hover { background: var(--danger-hover); }
+.btn:active { transform: translateY(1px); }
+.btn[disabled] { opacity: .5; cursor: not-allowed; }
+
+/* Filter (segmented control, radio group or buttons with aria-pressed) */
+.filter { display: flex; gap: var(--s2); margin-bottom: var(--s4); }
+.filter button { flex: 1; min-height: var(--tap); border-radius: var(--radius); border: 2px solid var(--control-border);
+  background: var(--surface); color: var(--text); font: 600 var(--fs-small)/1 var(--font); cursor: pointer; }
+.filter button:hover { background: #f0f4f8; }
+.filter button[aria-pressed="true"] { background: var(--primary); border-color: var(--primary); color: #fff; }
+
+/* Book list */
+.books { list-style: none; margin: 0; padding: 0; display: grid; gap: var(--s3); }
+.book { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); box-shadow: var(--shadow); }
+.book a { display: block; padding: var(--s4); color: inherit; text-decoration: none; border-radius: var(--radius); min-height: var(--tap); }
+.book a:hover { background: #f7f9fc; }
+.book a:active { transform: translateY(1px); }
+.book .t { font-size: var(--fs-h2); font-weight: 600; line-height: 1.3; margin: 0; overflow-wrap: anywhere; }
+.book .a { color: var(--muted); font-size: var(--fs-small); margin: var(--s1) 0 0; overflow-wrap: anywhere; }
+.book .meta { display: flex; flex-wrap: wrap; align-items: center; gap: var(--s2) var(--s3); margin-top: var(--s3); font-size: var(--fs-small); color: var(--muted); }
+.badge { display: inline-block; padding: 2px 10px; border-radius: var(--radius-pill); font-size: 0.8125rem; font-weight: 600; line-height: 1.5; }
+.badge-reading { background: var(--reading-bg); color: var(--reading-fg); }
+.badge-finished { background: var(--finished-bg); color: var(--finished-fg); }
+
+/* Empty state */
+.empty { text-align: center; background: var(--surface); border: 1px dashed var(--control-border); border-radius: var(--radius); padding: var(--s6) var(--s4); }
+.empty h2 { margin: 0 0 var(--s2); font-size: var(--fs-h2); }
+.empty p { margin: 0 0 var(--s4); color: var(--muted); }
+
+/* Form */
+.form { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: var(--s4); display: grid; gap: var(--s4); box-shadow: var(--shadow); }
+.field label, .field .lbl { display: block; font-weight: 600; font-size: var(--fs-small); margin-bottom: var(--s1); }
+.field .opt { font-weight: 400; color: var(--muted); }
+.field input, .field select { width: 100%; min-height: var(--tap); padding: 0 var(--s3); font: 400 var(--fs-body)/1.5 var(--font);
+  color: var(--text); background: var(--surface); border: 2px solid var(--control-border); border-radius: var(--radius); }
+.field input[aria-invalid="true"] { border-color: var(--danger); background: var(--danger-bg); }
+.err, .field .err { margin: var(--s1) 0 0; color: var(--danger); font-size: var(--fs-small); font-weight: 600; }
+.confirm .err { margin: 0 0 var(--s3); color: var(--danger); font-size: var(--fs-small); font-weight: 600; }
+.form > [role="alert"]:empty { margin-top: calc(-1 * var(--s4)); } /* empty alert region takes no space */
+.confirm [role="alert"]:empty { display: none; }
+.actions { display: flex; flex-direction: column-reverse; gap: var(--s3); }
+.actions .btn { width: 100%; }
+@media (min-width: 640px) { .actions { flex-direction: row; justify-content: flex-end; } .actions .btn { width: auto; } }
+.delete-zone { margin-top: var(--s5); padding-top: var(--s4); border-top: 1px solid var(--border); }
+
+/* Delete confirm panel (inline, role="alertdialog" or role="group" with focus moved to it) */
+.confirm { border: 2px solid var(--danger); background: var(--danger-bg); border-radius: var(--radius); padding: var(--s4); }
+.confirm p { margin: 0 0 var(--s3); font-weight: 600; }
+.confirm .actions { margin: 0; }
+
+.sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+@media (prefers-reduced-motion: reduce) { * { transition: none !important; animation: none !important; } }

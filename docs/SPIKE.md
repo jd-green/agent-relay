@@ -108,6 +108,8 @@ Milestone 1 is done when the table is filled in and a plan is chosen. Write both
 
 ## Results
 
+**Follow-up:** the first live Plan B build reached James's final sign-off gate. See [FIRST-BUILD.md](FIRST-BUILD.md) for evidence, defects, cost and remaining limits. This does not change the device-only spike rows below.
+
 **Run completed for Max-accessible surfaces:** 2026-10-30, 14:00–15:16 CT, by Max on his own Mac (not James's) against the deployed relay `https://agent-relay.dominion-equity.workers.dev` (main 13f83cb, version 4cd59511). Claude Code 2.1.314 (terminal, `claude --plugin-dir mods/relay-spike`, model haiku, `poll_seconds` 15, developer token). claude.ai in a browser, signed in as James (Ultra). The Claude desktop app and the phone app were not used: they are on James's devices. The live suite reported $0.0296 for 24 sessions (20/20 checks). The deployed terminal trial was also small, but its exact incremental cost has not been totaled; the shared account status line is not a trial cost meter. The claude.ai runs used James's plan.
 
 ### What changed since the runbook was written

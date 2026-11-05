@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Reading Log</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div class="wrap">
+  <header class="page-head">
+    <h1>Reading Log</h1>
+    <a class="btn btn-primary" href="edit.html">Add book</a>
+  </header>
+  <div class="filter" id="filter" role="group" aria-label="Filter books by status" hidden>
+    <button type="button" data-filter="all" aria-pressed="true">All</button>
+    <button type="button" data-filter="reading" aria-pressed="false">Reading</button>
+    <button type="button" data-filter="finished" aria-pressed="false">Finished</button>
+  </div>
+  <p class="sr-only" id="live" aria-live="polite"></p>
+  <div id="list"></div>
+</div>
+<script src="store.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

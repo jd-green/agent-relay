@@ -87,19 +87,21 @@ Custom connectors belong to your claude.ai account, not to a Project; a Project 
 
 ### claude.ai Projects (desktop app and web)
 
-Connector URL: `https://<worker>/mcp/<role-token>`
+Connector URL: `https://<worker>/mcp`
 
-The token goes in the path because claude.ai custom connectors may not send custom headers; the relay accepts the last path segment of `/mcp/<token>` as the token. The trade-off: the URL itself is now the secret. It can appear in browser history, screenshots and live logs. Keep it in 1Password, never paste it into a message (the relay rejects any role token with `secret_detected`), and rotate the token if it leaks.
+**Prefer header authentication when the connector form supports it.** On 2026-10-30, Max verified a claude.ai connector at `https://<worker>/mcp` with an `Authorization: Bearer <role-token>` header and no sign-in. A live `whoami` call returned `developer`. Each account still needs its own connectors and role instructions; the relay identifies roles by token, not Claude account.
+
+The path form remains a fallback: the relay accepts the last path segment of `/mcp/<token>` as the token. The URL then becomes a secret. It can appear in browser history, screenshots and live logs. Keep it in 1Password, never paste it into a message (the relay rejects any role token with `secret_detected`), and rotate the token if it leaks.
 
 Cloudflare logs: `wrangler.jsonc` turns Workers Logs' invocation logs off (`"logs": {"invocation_logs": false}`), so request URLs are not stored; the Worker's own `console` output still is. A live `npx wrangler tail` (or the dashboard's live log) still shows each request's URL, path tokens included. Give any Cloudflare API token an agent holds (the Developer's deploy token, say) no Workers Tail or Workers Observability permission on the relay's account.
 
-1. Copy a role's URL without it landing in your shell history (macOS):
+1. Copy the role token without putting it in shell history (macOS):
 
    ```sh
-   printf 'https://%s/mcp/%s' "<worker>" "$(op read "${OP_REF_DEVELOPER:-op://Agent Relay/Developer token/password}")" | pbcopy
+   op read --no-newline "${OP_REF_DEVELOPER:-op://Agent Relay/Developer token/password}" | pbcopy
    ```
 
-2. In Claude: **Settings → Connectors → Add custom connector**. Name it, paste the URL, leave OAuth empty, and add it.
+2. In Claude: **Settings → Connectors → Add custom connector**. Set the URL to `https://<worker>/mcp`. Add header `Authorization` with value `Bearer <role-token>`. Choose no sign-in (no OAuth). If the form has no header option, use `https://<worker>/mcp/<role-token>` instead and treat the whole URL as a secret.
 3. Repeat for each row below.
 4. In each role's Project, switch on only that role's relay connector and leave the others off. Check it in a thread: "Call whoami on the relay". It must name the Project's role.
 
@@ -194,6 +196,16 @@ So:
 
   The last command prints the service account's token once: keep it out of your shell history, e.g. in the macOS keychain (`security add-generic-password -a "$USER" -s "Agent Relay role sessions" -w`, which prompts for it). Then start role sessions with `OP_SERVICE_ACCOUNT_TOKEN="$(security find-generic-password -w -s "Agent Relay role sessions")"` in front of `scripts/role-session.sh <role>`, with the `OP_REF_<ROLE>` variables above set. The script reads the token with it, then removes it before `claude` starts. Delete the old role items from `Agent Relay` afterwards, and update the connector URLs (section 4).
 - A role that needs a credential of its own (the developer's deploy token for the app) gets one scoped to that job and kept where only that role's user can read it, never a token for the relay's Cloudflare account. Since the launcher removes `CLOUDFLARE_API_TOKEN` and `OP_*`, don't rely on exporting it in the shell you launch from.
+
+### First live build: container setup lessons
+
+The Reading Log trial used three containers on Max's Mac, one per role. Each loaded the full protocol through `role-session.sh`. It used API billing, not a Claude subscription allowance. Existing claude.ai Projects stayed unchanged. See [FIRST-BUILD.md](FIRST-BUILD.md) for the ledger, results and limits.
+
+- Give each role only its own home, state, work files and role token. Keep the host Docker socket, 1Password and human token out of the containers. The host operator still controls every role; this is not isolation from the operator.
+- Create shared preview folders before mounting them. If a nested bind mount shows an empty old directory, compare its listing with the role's listing. Restart the preview container after fixing the path. Verify HTTP 200 from both the host and receiving role.
+- Match commands to the tool allowlist. A plain `curl` call can pass while a compound command with unlisted `cd`, `echo` or `for` fails. Test the exact command before reporting missing permission. Do not broaden permissions to fix a command-format error.
+- Provide a browser for interaction and visual review, or require a separate browser QA step before sign-off. A `curl` read proves neither layout nor working controls. This trial's roles had no browser; Max supplied that QA.
+- Record localStorage write failures visibly. Do not leave the form or claim success until storage confirms the write.
 
 ### One role on a machine: install
 
