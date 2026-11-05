@@ -1,0 +1,4 @@
+orchestrator       calls=  26 in=      64 out=   6419 cache_w=  128330 cache_r=   997908 $0.88
+creative-director  calls=  35 in=      84 out=  18077 cache_w=   97946 cache_r=  2272984 $1.32
+developer          calls=  36 in=      84 out=  20526 cache_w=   87307 cache_r=  2158766 $1.28
+TOTAL $3.48

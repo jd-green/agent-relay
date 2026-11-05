@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Add book - Reading Log</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div class="wrap">
+  <div id="notfound" hidden>
+    <header class="page-head"><h1>Book not found</h1></header>
+    <div class="empty">
+      <p>This book may have been deleted.</p>
+      <a class="btn btn-primary" href="index.html">Back to log</a>
+    </div>
+  </div>
+
+  <div id="editor">
+    <header class="page-head"><h1 id="heading">Add book</h1></header>
+    <form class="form" id="form" novalidate>
+      <div class="field">
+        <label for="title">Title</label>
+        <input type="text" id="title" name="title" autocomplete="off" aria-describedby="title-err">
+        <p class="err" id="title-err" hidden>Enter a title to save this book.</p>
+      </div>
+      <div class="field">
+        <label for="author">Author <span class="opt">(optional)</span></label>
+        <input type="text" id="author" name="author" autocomplete="off">
+      </div>
+      <div class="field">
+        <label for="status">Status</label>
+        <select id="status" name="status">
+          <option value="reading">Reading</option>
+          <option value="finished">Finished</option>
+        </select>
+      </div>
+      <div class="field" id="date-field" hidden>
+        <label for="date">Date finished</label>
+        <input type="date" id="date" name="date">
+      </div>
+      <div role="alert" id="save-err"></div>
+      <div class="actions">
+        <a class="btn btn-secondary" href="index.html">Cancel</a>
+        <button type="submit" class="btn btn-primary">Save</button>
+      </div>
+    </form>
+
+    <div class="delete-zone" id="delete-zone" hidden>
+      <button type="button" class="btn btn-danger" id="delete-btn">Delete book</button>
+      <div class="confirm" id="confirm" role="alertdialog" aria-labelledby="confirm-msg" tabindex="-1" hidden>
+        <p id="confirm-msg"></p>
+        <div role="alert" id="delete-err"></div>
+        <div class="actions">
+          <button type="button" class="btn btn-secondary" id="keep-btn">Keep book</button>
+          <button type="button" class="btn btn-danger-solid" id="yes-btn">Yes, delete</button>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+<script src="store.js"></script>
+<script src="edit.js"></script>
+</body>
+</html>
